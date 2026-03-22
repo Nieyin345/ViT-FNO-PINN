@@ -1,0 +1,21 @@
+# 数据文件（太大，不推）
+data/em_data_meep/
+*.npy
+
+# 模型权重
+checkpoints/*.pth
+
+# Python 缓存
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# 临时文件
+*.tar.gz
+cloudflared
+vscode_cli*
+
+# 系统文件
+.DS_Store
+Thumbs.db
