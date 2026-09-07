@@ -87,6 +87,7 @@ class Trainer:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[Trainer] 设备: {self.device}")
+        os.makedirs(getattr(C, "SAVE_DIR", "checkpoints"), exist_ok=True)
         if not HAS_MATPLOTLIB:
             print("[警告] 未检测到 matplotlib，可视化与训练曲线保存将被跳过。")
 
@@ -664,4 +665,3 @@ class Trainer:
 
 if __name__ == "__main__":
     Trainer().run()
-

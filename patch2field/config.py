@@ -70,7 +70,7 @@ LR_WARMUP_EPOCHS = 10
 WEIGHT_DECAY = 1e-4
 GRAD_CLIP_MAX_NORM = 1.0
 
-NUM_WORKERS = 0
+NUM_WORKERS = 2   # Windows + mmap 加载下建议 2~4，过多反而因进程开销变慢
 PIN_MEMORY = True
 VAL_EVERY = 5
 

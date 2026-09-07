@@ -109,7 +109,6 @@ freq_dim=32, out_channels=12`，参数量约 **8.05M**。
 | `fno2d_baseline.py` | 纯 FNO2d：无超网络/注意力，freq 展开为常数通道拼入输入（in=3） |
 | `fno2d_film.py` | FNO + FiLM 条件调制 |
 | `fno2d_lora.py` | FNO + LoRA 风格频率条件卷积核 |
-| `fno2d_multiplane.py` | 多平面版本（x, freq, z 三输入） |
 | `unet2d.py` | 纯空间域 U-Net 基线 |
 
 ### 实验切换（`patch2field/experiment_config.py`）
@@ -130,8 +129,8 @@ fno_baseline_parity(参数量对齐~8M) / fno_lora / fno_film / unet`，保存�
 | L9 | pinn_maxwell | 0.0 | 麦克斯韦残差约束（需 v2 体数据提供相邻平面） |
 
 注意：默认数据走 `v2_cache`（无相邻平面），故 L9 默认关闭；要启用 PINN
-需使用 `v2`（体数据，`field_volume_merged.npy`）或 `train_multiplane.py`。
-若在 `v2_cache` 下误开启 L9，训练启动时会打印警告。
+需使用 `v2`（体数据，`field_volume_merged.npy`）。若在 `v2_cache` 下误开启 L9，
+训练启动时会打印警告。
 
 输出标准化：训练集统计 12 通道统计量，训练用标准化空间，保存/评估自动反标准化。
 默认 `OUTPUT_NORM_MODE="log"`（推荐）：对每个通道做 `sign(x)*log1p(|x|/scale)`
@@ -160,23 +159,23 @@ fno_baseline_parity(参数量对齐~8M) / fno_lora / fno_film / unet`，保存�
 val_loss / val_rel / val_geom / use_output_standardization`，标准化开启时含
 `output_norm_mode` 与对应参数（zscore: mean/std；log: scale/logmean/logstd）。
 `val_rel / val_geom` 为**物理空间**指标（先反归一化再计算），避免 log 归一化空间
-导致方向角/相位失真；训练损失仍在归一化空间计算。`train_multiplane.py` 保存
-`use_output_standardization=False` 且不包含统计量（其数据未标准化）。
+导致方向角/相位失真；训练损失仍在归一化空间计算。
 
 `output_norm_stats.npz` 保存于各实验目录（含模式与参数），便于离线评估反标准化。
+训练启动时若 `SAVE_DIR` 不存在会自动创建（`train.py` 内置 `makedirs`）。
 
-### ⚠️ checkpoint 与代码架构差异
+### ⚠️ checkpoint 说明
 
-`checkpoints/fno_attention/best.pth` 为**旧架构训练产物**（6 个普通 `heads` 输出头），
-与当前 `e_heads/h_heads` 结构有 24 层差异。评估脚本会检测并按匹配层加载并打印警告，
-但未匹配层为随机初始化，**结果仅供参考**；正式复现请用当前代码重新训练。
+历史 checkpoint（旧架构、旧归一化）已清理删除；`checkpoints/` 现在为空，
+下一次训练会自动重建目录。所有历史对比结果不作数，需用当前代码重新训练后再评估。
 
 ---
 
 ## 评估
 
-- `patch2field/eval_generalization.py`：circle+cross 训练 → rectangle 泛化对比
-  （主模型 vs 基线）；模型结构从 checkpoint 自动推断，不再依赖硬编码宽度/通道。
+- `patch2field/eval_generalization.py`：circle/circle_ring/cross/square_ring 训练 →
+  rectangle（`1_rectangle`）泛化对比（主模型 vs 两个基线：`fno_baseline_large` 与
+  参数量对齐的 `fno_baseline_parity`）；模型结构从 checkpoint 自动推断。
 - `patch2field/ui_eval.py`：交互式评估 UI（误差热力图、样本浏览）。
 - `field2field/`：PWS 传播工具（见其 README），把 FNO 预测截面传播到全空间。
 
@@ -185,16 +184,11 @@ val_loss / val_rel / val_geom / use_output_standardization`，标准化开启时
 | 路径 | 说明 |
 |------|------|
 | `patch2field/train.py` | 主训练（v2/v2_cache 全频点） |
-| `patch2field/train_multiplane.py` | 多平面散射场训练（含 PINN 约束） |
 | `patch2field/config.py` | 全局配置（损失向量、模型、训练超参） |
 | `patch2field/experiment_config.py` | 实验总控（切换模型与保存路径） |
-| `patch2field/models/` | FNO 模型族（fno2d / baseline / film / lora / multiplane / unet） |
+| `patch2field/models/` | FNO 模型族（fno2d / baseline / film / lora / unet） |
 | `patch2field/models/losses.py` | 损失函数（geom / DC-AC / 频域 / PINN） |
-| `data/dataset.py` | 主数据集（v1/v2/v2_cache） |
-| `data/dataset_multiplane.py` | 多平面散射场数据集（z=3mm + PINN 层 z=4mm） |
-| `data/dataset_propagator.py` | 场传播数据集（源 0.1λ → 目标 z 层） |
-| `field2field/` | PWS 传播工具（.fld 读写、传播、可视化） |
+| `data/dataset.py` | 主数据集（v2_cache / v2 / v1） |
+| `field2field/` | PWS 传播工具（.fld 读写、传播、可视化、FNO 到全空间衔接） |
 | `LOSS_DESIGN.md` | 自适应权重损失设计（计划中，未实现） |
 | `requirements.txt` | 依赖清单 |
-
-
