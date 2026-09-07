@@ -11,7 +11,9 @@ DATA_DIR = os.path.abspath(os.path.join(_BASE_DIR, "../data/data"))
 SAVE_DIR = os.path.abspath(os.path.join(_BASE_DIR, "../checkpoints"))
 MODEL_NAME = "fno_attention"
 
-TRAIN_CATEGORIES = ["circle"]
+# 训练类别（v2 数据共 5 类）。矩形类（数据目录 "1_rectangle"）留作
+# 形状泛化评估（eval_generalization.py），训练时不纳入。
+TRAIN_CATEGORIES = ["circle", "circle_ring", "cross", "square_ring"]
 TRAIN_FREQS = None  # 全部9个频点
 
 # 数据平滑
@@ -30,8 +32,13 @@ SHUFFLE_SEED = 42
 # 输出通道全局标准化（训练集统计）
 # - 训练：使用标准化后的 12 通道输出作为监督
 # - 推理/评估：从 checkpoint 读取统计量并自动反标准化
-# - 电场和磁场分别归一化，避免尺度差异
+# - 电场（std~1e2~1e3）与磁场（Hx~3, Hy/Hz~1）尺度相差约 3 个数量级，默认做对数压缩
 USE_OUTPUT_STANDARDIZATION = True
+# 归一化模式：
+#   "log"    - sign(x)*log1p(|x|/scale) 逐通道对数压缩动态范围后再 z-score（推荐，保留正负号）
+#   "zscore" - 逐通道线性 (x-mean)/std（旧行为）
+#   "none"   - 不归一化（调试/对比用）
+OUTPUT_NORM_MODE = "log"
 OUTPUT_STANDARDIZATION_EPS = 1e-8
 OUTPUT_NORM_STATS_PATH = f"{SAVE_DIR}/output_norm_stats.npz"
 
@@ -135,11 +142,13 @@ DETAIL_LOSS_RAMP_EPOCHS = 200
 #   含义: 基于真实数据差分的麦克斯韦方程残差约束
 
 # 向量开关：1=启用，0=关闭（顺序对应 L1~L9）
-# 关闭高频抑制 (index=5)，开启 PINN (index=8)
-LOSS_ENABLE_VECTOR = [0, 0, 1, 0, 0, 0, 0, 1, 1]
+# 关闭高频抑制 (index=5)
+# 注意：L9(PINN, index=8) 需要 v2 体数据（field_volume_merged.npy，含相邻 z 平面才能做
+# 中心差分）；当前默认数据为 v2_cache 缓存平面（无相邻平面），故默认关闭，改用体数据时再开启。
+LOSS_ENABLE_VECTOR = [0, 0, 1, 0, 0, 0, 0, 1, 0]
 
 # 向量权重：顺序对应 L1~L9
-LOSS_WEIGHT_VECTOR = [0.0, 0.0, 1, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+LOSS_WEIGHT_VECTOR = [0.0, 0.0, 1, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 # ---- L2/L7 共享内部参数：DC/AC 子权重 ----
 

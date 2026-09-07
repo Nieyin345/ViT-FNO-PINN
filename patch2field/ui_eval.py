@@ -29,6 +29,7 @@ from scipy.ndimage import distance_transform_edt
 
 import config as C
 from data.dataset import EMMultiFreqDataset
+from data.norm_utils import OutputNormalizer
 from models.fno2d import FNO2d
 from models.fno2d_baseline import FNO2dBaseline
 from models.fno2d_film import FNO2dFiLM
@@ -156,8 +157,7 @@ class EvalApp:
         self._val_ds = None
         self._running = False
         self._warned_channel_mismatch = False
-        self._output_norm_mean_t = None
-        self._output_norm_std_t = None
+        self._output_normalizer = None
         
         self.build_ui()
         
@@ -816,8 +816,7 @@ class EvalApp:
     def _load_checkpoint_robust(self, ckpt_path):
         """鲁棒加载：仅加载名称与形状都匹配的权重，避免模型变更导致崩溃。"""
         meta = {"epoch": "N/A", "val_loss": "N/A", "val_rel": "N/A", "loaded": 0, "skipped": 0}
-        self._output_norm_mean_t = None
-        self._output_norm_std_t = None
+        self._output_normalizer = None
 
         if not os.path.exists(ckpt_path):
             self.update_status(f"未找到检查点，使用随机初始化模型: {ckpt_path}")
@@ -828,12 +827,12 @@ class EvalApp:
             meta["epoch"] = ckpt.get("epoch", "N/A")
             meta["val_loss"] = ckpt.get("val_loss", "N/A")
             meta["val_rel"] = ckpt.get("val_rel", "N/A")
-            if "output_norm_mean" in ckpt and "output_norm_std" in ckpt:
-                mean = torch.as_tensor(ckpt["output_norm_mean"], dtype=torch.float32, device=self._device).view(1, -1, 1, 1)
-                std = torch.as_tensor(ckpt["output_norm_std"], dtype=torch.float32, device=self._device).view(1, -1, 1, 1)
-                self._output_norm_mean_t = mean
-                self._output_norm_std_t = std
-                self.update_status("检测到输出标准化统计量，预测结果将自动反标准化")
+            self._output_normalizer = OutputNormalizer.from_checkpoint(ckpt)
+            if self._output_normalizer is not None:
+                self.update_status(
+                    f"检测到输出标准化统计量（模式={self._output_normalizer.mode}），"
+                    "预测结果将自动反标准化"
+                )
 
         state_dict = self._extract_state_dict(ckpt)
         if state_dict is None:
@@ -911,12 +910,10 @@ class EvalApp:
         return pred[:, :n], tgt[:, :n]
 
     def _maybe_denorm_pred(self, pred):
-        if self._output_norm_mean_t is None or self._output_norm_std_t is None:
+        if self._output_normalizer is None:
             return pred
-        n = min(pred.shape[1], self._output_norm_mean_t.shape[1])
-        out = pred.clone()
-        out[:, :n] = out[:, :n] * self._output_norm_std_t[:, :n] + self._output_norm_mean_t[:, :n]
-        return out
+        n = min(pred.shape[1], self._output_normalizer.n_channels)
+        return self._output_normalizer.denormalize(pred, ch_slice=slice(0, n))
     
     def load_data_model(self):
         """加载数据和模型"""

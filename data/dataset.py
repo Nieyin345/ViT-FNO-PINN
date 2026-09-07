@@ -88,10 +88,12 @@ class EMMultiFreqDataset(Dataset):
         self.target_d_over_lambda = target_d_over_lambda
         self.use_scatter  = use_scatter
         self.bg_params_path = bg_params_path
-        self.output_norm_mean = None
-        self.output_norm_std = None
+        self.output_normalizer = None
         if output_norm_mean is not None and output_norm_std is not None:
-            self.set_output_normalization(output_norm_mean, output_norm_std)
+            from data.norm_utils import OutputNormalizer
+            self.set_output_normalization(
+                OutputNormalizer(mode="zscore", mean=output_norm_mean, std=output_norm_std)
+            )
 
         freq_targets = FREQ_LIST if target_freq is None else \
                        [float(target_freq.replace("GHz", ""))]
@@ -224,13 +226,9 @@ class EMMultiFreqDataset(Dataset):
         for i, s in enumerate(self.samples):
             self.shape_to_indices[(s["category"], s["name"])].append(i)
 
-    def set_output_normalization(self, mean, std):
-        mean = np.asarray(mean, dtype=np.float32).reshape(-1)
-        std = np.asarray(std, dtype=np.float32).reshape(-1)
-        assert mean.size == std.size, "mean/std 通道数不一致"
-        std = np.maximum(std, 1e-8)
-        self.output_norm_mean = mean
-        self.output_norm_std = std
+    def set_output_normalization(self, normalizer):
+        """设置输出归一化器（data.norm_utils.OutputNormalizer）。"""
+        self.output_normalizer = normalizer
 
     def _output_norm_slice(self, n_channels=None):
         if self.output_field == "all":
@@ -345,12 +343,10 @@ class EMMultiFreqDataset(Dataset):
             out = out - bg_broadcast
 
         if self.normalize:
-            if self.output_norm_mean is None or self.output_norm_std is None:
-                raise RuntimeError("normalize=True 但未设置 output_norm_mean/std")
+            if self.output_normalizer is None:
+                raise RuntimeError("normalize=True 但未设置 output_normalizer")
             sl = self._output_norm_slice(n_channels=out.shape[0])
-            mean = self.output_norm_mean[sl][:, None, None]
-            std = self.output_norm_std[sl][:, None, None]
-            out = (out - mean) / std
+            out = self.output_normalizer.normalize_np(out, ch_slice=sl)
 
         freq_norm = (s["freq_ghz"] - FREQ_MIN) / (FREQ_MAX - FREQ_MIN)
         

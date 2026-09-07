@@ -1,6 +1,7 @@
 """
 形状泛化评估脚本
-训练只用 circle + cross_base，测试在 rectangle 上的泛化误差
+训练用 v2 数据的 circle/circle_ring/cross/square_ring（rectangle 留出），
+测试在 rectangle（数据目录 "1_rectangle"）上的泛化误差
 对比主模型（fno_attention）和基线（fno_baseline）
 """
 
@@ -14,6 +15,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 import config as C
 from data.dataset import EMMultiFreqDataset
+from data.norm_utils import OutputNormalizer
 from models.fno2d import FNO2d
 from models.fno2d_baseline import FNO2dBaseline
 from models.losses import field_geom_loss
@@ -96,14 +98,13 @@ def load_model(model_cls, ckpt_path, **kwargs):
 def maybe_denorm(pred, ckpt_path):
     """从 checkpoint 读取归一化统计量并反归一化。"""
     ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-    if isinstance(ckpt, dict) and "output_norm_mean" in ckpt:
-        mean = torch.as_tensor(ckpt["output_norm_mean"], dtype=torch.float32, device=DEVICE).view(1,-1,1,1)
-        std  = torch.as_tensor(ckpt["output_norm_std"],  dtype=torch.float32, device=DEVICE).view(1,-1,1,1)
-        return pred * std + mean
-    return pred
+    norm = OutputNormalizer.from_checkpoint(ckpt)
+    if norm is None:
+        return pred
+    return norm.denormalize(pred)
 
 
-def evaluate(model, loader, ckpt_path, model_name, norm_mean=None, norm_std=None):
+def evaluate(model, loader, ckpt_path, model_name, normalizer=None):
     model.eval()
     geom_errors = []
     rel_errors  = []
@@ -116,9 +117,9 @@ def evaluate(model, loader, ckpt_path, model_name, norm_mean=None, norm_std=None
 
             pred = model(inp, freq)
 
-            # 反归一化 pred
-            if norm_mean is not None and norm_std is not None:
-                pred = pred * norm_std + norm_mean
+            # 反归一化 pred（物理空间评估）
+            if normalizer is not None:
+                pred = normalizer.denormalize(pred)
 
             # geom loss（物理空间）
             g, _ = field_geom_loss(pred, tgt)
@@ -140,7 +141,7 @@ def evaluate(model, loader, ckpt_path, model_name, norm_mean=None, norm_std=None
 
 def main():
     print("=" * 55)
-    print("形状泛化评估：训练集 circle+cross_base，测试 rectangle")
+    print("形状泛化评估：训练集 circle/circle_ring/cross/square_ring，测试 rectangle")
     print("=" * 55)
 
     # 加载 rectangle 数据（不做归一化，在物理空间评估）
@@ -152,8 +153,9 @@ def main():
         use_scatter=getattr(C, "USE_SCATTER_FIELD", False),
         bg_params_path=getattr(C, "BACKGROUND_PARAMS_PATH", "data/blank/background_params.npz"),
     )
+    # 矩形类数据在 v2 数据中目录名为 "1_rectangle"
     dataset.samples = [s for s in dataset.samples
-                       if s["category"].startswith("rectangle")]
+                       if "rectangle" in s["category"]]
     print(f"\nRectangle 样本数: {len(dataset.samples)}")
     if len(dataset.samples) == 0:
         print("未找到 rectangle 数据，请检查路径")
@@ -172,21 +174,17 @@ def main():
     model_base = load_model(FNO2dBaseline, ckpt_base)
 
     # ── 读取各自的归一化统计量 ──────────────────────────
-    def load_norm_stats(ckpt_path):
+    def load_normalizer(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-        if isinstance(ckpt, dict) and "output_norm_mean" in ckpt:
-            mean = torch.as_tensor(ckpt["output_norm_mean"], dtype=torch.float32, device=DEVICE).view(1,-1,1,1)
-            std  = torch.as_tensor(ckpt["output_norm_std"],  dtype=torch.float32, device=DEVICE).view(1,-1,1,1)
-            return mean, std
-        return None, None
+        return OutputNormalizer.from_checkpoint(ckpt)
 
     # ── 评估 ─────────────────────────────────────────────
     print("\n开始评估...")
-    mean_attn, std_attn = load_norm_stats(ckpt_attn)
-    mean_base, std_base = load_norm_stats(ckpt_base)
+    norm_attn = load_normalizer(ckpt_attn)
+    norm_base = load_normalizer(ckpt_base)
 
-    g_attn, r_attn = evaluate(model_attn, loader, ckpt_attn, "fno_attention",    mean_attn, std_attn)
-    g_base, r_base = evaluate(model_base, loader, ckpt_base, "fno_baseline_large", mean_base, std_base)
+    g_attn, r_attn = evaluate(model_attn, loader, ckpt_attn, "fno_attention",    norm_attn)
+    g_base, r_base = evaluate(model_base, loader, ckpt_base, "fno_baseline_large", norm_base)
 
     # ── 汇总 ─────────────────────────────────────────────
     print("\n" + "=" * 55)

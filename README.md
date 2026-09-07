@@ -63,5 +63,8 @@ python field2field/propagate_scatter.py --source-z-mm 3 --targets-mm 5,7,9 --fre
 ## 说明
 
 - checkpoints 下的 `.pth`/`.npz` 与数据文件已被 `.gitignore` 排除，不入版本库
+- 输出归一化默认 `OUTPUT_NORM_MODE="log"`：`sign(x)*log1p(|x|/scale)` 压缩动态范围后逐通道 z-score，解决电场（~1e3）与磁场（~0.7~3）尺度差约 3 个数量级的问题；恢复旧行为可设 `"zscore"`。统计量与模式保存在 checkpoint，训练/评估/UI 自动反归一化
+- 训练类别默认 `circle/circle_ring/cross/square_ring`（rectangle 留作形状泛化评估，数据目录 `1_rectangle`），见 `patch2field/config.py`
 - `checkpoints/fno_attention/` 是旧架构产物，重新训练前评估结果仅供参考（详见 `MODEL_DOC.md`）
 - 详细架构、损失与配置见 `MODEL_DOC.md`
+

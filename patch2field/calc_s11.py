@@ -18,6 +18,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import config as C
 from data.dataset import EMMultiFreqDataset
+from data.norm_utils import OutputNormalizer
 from data.fit_background import get_background_field, FREQS_GHZ
 from models.fno2d_lora import FNO2dLoRA
 
@@ -75,17 +76,18 @@ def load_model(ckpt_path):
     model.load_state_dict(msd, strict=False)
     model.eval()
 
-    norm_mean = torch.tensor(ckpt["output_norm_mean"]).view(1, -1, 1, 1)
-    norm_std  = torch.tensor(ckpt["output_norm_std"]).view(1, -1, 1, 1)
-    return model, norm_mean, norm_std
+    normalizer = OutputNormalizer.from_checkpoint(ckpt)
+    return model, normalizer
 
 
-def predict_scatter(model, norm_mean, norm_std, sample):
+def predict_scatter(model, normalizer, sample):
     inp  = sample["input"].unsqueeze(0)
     freq = sample["freq"].unsqueeze(0)
     with torch.no_grad():
         pred = model(inp, freq)
-    pred_phys = (pred * norm_std + norm_mean)[0]  # (12, H, W)
+    if normalizer is not None:
+        pred = normalizer.denormalize(pred)
+    pred_phys = pred[0]  # (12, H, W)
     # 转成 (H, W, 12)
     return pred_phys.permute(1, 2, 0).numpy()
 
@@ -108,7 +110,7 @@ def main():
     csv_path   = f"{sample_dir}/circle_ring_1_S_Parameters.csv"
 
     print("加载模型...")
-    model, norm_mean, norm_std = load_model(ckpt_path)
+    model, normalizer = load_model(ckpt_path)
 
     print("加载数据集...")
     ds = EMMultiFreqDataset(
@@ -140,7 +142,7 @@ def main():
         sample = ds[idx]
 
         # 预测散射场
-        scatter = predict_scatter(model, norm_mean, norm_std, sample)  # (H, W, 12)
+        scatter = predict_scatter(model, normalizer, sample)  # (H, W, 12)
 
         # 计算 S11
         _, s11_db = calc_s11(scatter, freq, z_mm)

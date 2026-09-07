@@ -131,31 +131,46 @@ class Trainer:
             full_dataset.shape_to_indices[(s["category"], s["name"])].append(i)
 
         self.use_output_norm = bool(getattr(C, "USE_OUTPUT_STANDARDIZATION", False))
-        self.output_norm_mean = None
-        self.output_norm_std = None
-        self.output_norm_mean_t = None
-        self.output_norm_std_t = None
+        self.output_norm_mode = str(getattr(C, "OUTPUT_NORM_MODE", "zscore")).lower()
+        self.output_normalizer = None
+        self._denorm_tp = None
         if self.use_output_norm:
-            mean, std = self._compute_output_norm_stats_from_subset(full_dataset, train_ds)
-            full_dataset.set_output_normalization(mean, std)
+            self.output_normalizer = self._compute_output_normalizer(full_dataset, train_ds)
+            full_dataset.set_output_normalization(self.output_normalizer)
             full_dataset.normalize = True
-            self.output_norm_mean = mean
-            self.output_norm_std = std
-            n_ch = len(mean)
-            self.output_norm_mean_t = torch.from_numpy(mean).view(1, n_ch, 1, 1).to(self.device)
-            self.output_norm_std_t = torch.from_numpy(std).view(1, n_ch, 1, 1).to(self.device)
+            self._denorm_tp = self.output_normalizer.tensor_params(self.device)
             stats_path = getattr(C, "OUTPUT_NORM_STATS_PATH", f"{C.SAVE_DIR}/output_norm_stats.npz")
             try:
-                np.savez(stats_path, mean=mean, std=std)
+                np.savez(stats_path, **self.output_normalizer.to_dict())
                 print(f"[输出标准化] 已保存统计量: {stats_path}")
             except Exception as e:
                 print(f"[输出标准化] 统计量保存失败: {e}")
+            n_ch = self.output_normalizer.n_channels
             ch_names = ["Ex_r", "Ex_i", "Ey_r", "Ey_i", "Ez_r", "Ez_i",
                         "Hx_r", "Hx_i", "Hy_r", "Hy_i", "Hz_r", "Hz_i"][:n_ch]
-            stat_str = ", ".join(
-                f"{n}(mu={m:.3e},std={s:.3e})" for n, m, s in zip(ch_names, mean, std)
-            )
-            print(f"[输出标准化] 通道统计: {stat_str}")
+            if self.output_norm_mode == "log":
+                stat_str = ", ".join(
+                    f"{n}(scale={sc:.3e},logmu={lm:.3e},logstd={ls:.3e})"
+                    for n, sc, lm, ls in zip(ch_names, self.output_normalizer.scale,
+                                             self.output_normalizer.logmean,
+                                             self.output_normalizer.logstd)
+                )
+            else:
+                stat_str = ", ".join(
+                    f"{n}(mu={m:.3e},std={s:.3e})"
+                    for n, m, s in zip(ch_names, self.output_normalizer.mean,
+                                       self.output_normalizer.std)
+                )
+            print(f"[输出标准化] 模式={self.output_norm_mode}  通道统计: {stat_str}")
+
+        # L9(PINN) 数据可用性检查：v2_cache 缓存平面没有相邻 z 平面，L9 无法生效
+        w_vec = self._get_loss_weight_vector()
+        if len(w_vec) > 8 and w_vec[8] != 0.0:
+            if not any(s.get("fmt") == "v2" for s in full_dataset.samples):
+                print("[警告] L9(PINN 麦克斯韦残差) 已启用，但当前数据为 v2_cache 缓存平面"
+                      "（无 out_zminus/out_zplus 相邻平面），该损失不会参与训练。"
+                      "如需启用请改用 v2 体数据（field_volume_merged.npy），"
+                      "或在 config.py 中将 LOSS_ENABLE_VECTOR[8] 设为 0。")
 
         print(f"[数据] 训练: {len(train_ds)}, 验证: {len(val_ds)}")
 
@@ -203,9 +218,14 @@ class Trainer:
         if self.only_save_pth:
             print("[输出] ONLY_SAVE_PTH=True，已关闭训练曲线保存")
 
-    def _compute_output_norm_stats_from_subset(self, dataset, subset):
-        """Compute global per-channel mean/std from training subset only."""
+    def _compute_output_normalizer(self, dataset, subset):
+        """Compute normalization stats from training subset only.
+
+        - zscore: 原始通道 mean/std
+        - log:    scale=原始 std，再对 sign*log1p(|x|/scale) 结果做二次标准化（logmean/logstd）
+        """
         from torch.utils.data import Subset
+        from data.norm_utils import OutputNormalizer
         indices = subset.indices if isinstance(subset, Subset) else list(range(len(dataset)))
 
         # 先取一个样本确定实际通道数，不依赖 OUT_CHANNELS 配置
@@ -228,7 +248,29 @@ class Trainer:
         mean = sum_v / max(1, count)
         var  = np.maximum(sum_sq / max(1, count) - mean * mean, eps * eps)
         std  = np.sqrt(var)
-        return mean.astype(np.float32), std.astype(np.float32)
+
+        if self.output_norm_mode == "zscore":
+            return OutputNormalizer(mode="zscore", mean=mean, std=std, eps=eps)
+        if self.output_norm_mode == "log":
+            # 二次遍历：log1p 压缩后逐通道标准化
+            scale = np.maximum(std, eps)
+            ly_sum = np.zeros(n_ch, dtype=np.float64)
+            ly_sq  = np.zeros(n_ch, dtype=np.float64)
+            for idx in indices:
+                sample = dataset[int(idx)]
+                out = sample["output"].numpy().astype(np.float64)  # (n_ch, H, W)
+                flat = out.reshape(n_ch, -1)
+                y = np.sign(flat) * np.log1p(np.abs(flat) / scale[:, None])
+                ly_sum += y.sum(axis=1)
+                ly_sq  += (y * y).sum(axis=1)
+            logmean = ly_sum / max(1, count)
+            logvar  = np.maximum(ly_sq / max(1, count) - logmean * logmean, eps * eps)
+            logstd  = np.sqrt(logvar)
+            return OutputNormalizer(mode="log", scale=scale,
+                                    logmean=logmean, logstd=logstd, eps=eps)
+        if self.output_norm_mode == "none":
+            return OutputNormalizer(mode="none")
+        raise ValueError(f"不支持的 OUTPUT_NORM_MODE: {self.output_norm_mode}")
 
     def _ramp_weight(self, target, epoch, warmup_epochs):
         """Linear warmup for auxiliary terms to avoid early optimization conflicts."""
@@ -283,9 +325,9 @@ class Trainer:
         return w
 
     def _denorm_output(self, x):
-        if not self.use_output_norm:
+        if self._denorm_tp is None:
             return x
-        return x * self.output_norm_std_t + self.output_norm_mean_t
+        return self.output_normalizer.denormalize(x, tp=self._denorm_tp)
 
     def complex_channel_rel_error(self, pred, true):
         """6通道分别计算DC/AC误差后取平均。"""
@@ -572,8 +614,7 @@ class Trainer:
                     "use_output_standardization": self.use_output_norm,
                 }
                 if self.use_output_norm:
-                    ckpt["output_norm_mean"] = self.output_norm_mean
-                    ckpt["output_norm_std"] = self.output_norm_std
+                    ckpt.update(self.output_normalizer.to_dict())
                 torch.save(ckpt, f"{C.SAVE_DIR}/latest.pth")
 
             if is_best:
@@ -589,8 +630,7 @@ class Trainer:
                     "use_output_standardization": self.use_output_norm,
                 }
                 if self.use_output_norm:
-                    ckpt["output_norm_mean"] = self.output_norm_mean
-                    ckpt["output_norm_std"] = self.output_norm_std
+                    ckpt.update(self.output_normalizer.to_dict())
                 torch.save(ckpt, f"{C.SAVE_DIR}/best.pth")
             else:
                 self.patience += 1

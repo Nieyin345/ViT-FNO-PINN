@@ -114,7 +114,7 @@ freq_dim=32, out_channels=12`，参数量约 **8.05M**。
 ### 实验切换（`patch2field/experiment_config.py`）
 
 改 `ACTIVE_EXPERIMENT` 即可切换 `fno_attention / fno_baseline / fno_baseline_large /
-fno_lora / fno_film / unet`，保存路径自动隔离到 `checkpoints/<name>/`。
+fno_baseline_parity(参数量对齐~8M) / fno_lora / fno_film / unet`，保存路径自动隔离到 `checkpoints/<name>/`。
 
 ---
 
@@ -126,12 +126,18 @@ fno_lora / fno_film / unet`，保存路径自动隔离到 `checkpoints/<name>/`�
 |------|------|------|------|
 | L3 | geom | 1.0 | 全场几何损失（方向角 + 相位 + 总场幅值） |
 | L8 | ch_rel6_mean | 1.0 | 逐通道相对 L2 均值（与保存指标同口径） |
-| L9 | pinn_maxwell | 1.0 | 麦克斯韦残差约束（需 v2 格式提供相邻平面） |
+| L9 | pinn_maxwell | 0.0 | 麦克斯韦残差约束（需 v2 体数据提供相邻平面） |
 
-注意：默认数据走 `v2_cache`（无相邻平面），L9 自动跳过；要启用 PINN
-需使用 `v2`（体数据）或 `train_multiplane.py`。
+注意：默认数据走 `v2_cache`（无相邻平面），故 L9 默认关闭；要启用 PINN
+需使用 `v2`（体数据，`field_volume_merged.npy`）或 `train_multiplane.py`。
+若在 `v2_cache` 下误开启 L9，训练启动时会打印警告。
 
-输出标准化：训练集统计 12 通道 mean/std，训练用标准化空间，保存/评估自动反标准化。
+输出标准化：训练集统计 12 通道统计量，训练用标准化空间，保存/评估自动反标准化。
+默认 `OUTPUT_NORM_MODE="log"`（推荐）：对每个通道做 `sign(x)*log1p(|x|/scale)`
+对数压缩动态范围后再逐通道 z-score，scale=训练集该通道 std。理由：电场
+（std~1e2~1e3）与磁场（Hx~3，Hy/Hz~1）尺度相差约 3 个数量级，线性 z-score
+会让小尺度通道的细微结构被大尺度通道淹没。切换 `OUTPUT_NORM_MODE="zscore"`
+可恢复旧的逐通道线性标准化；checkpoint 中保存模式与参数，旧 checkpoint 自动按 zscore 解释。
 
 ---
 
