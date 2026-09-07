@@ -50,27 +50,6 @@ EXPERIMENTS = {
         "LORA_RANK":  16,
     },
 
-    "fno_attention_old": {
-        "MODEL_NAME":       "fno_attention",
-        "SAVE_DIR":         _abs("../checkpoints/fno_attention_old"),
-        "DATA_DIR":         _abs("../data/em_data"),
-        "OUT_CHANNELS":     6,
-        "TRAIN_FREQS":      None,
-        "TRAIN_CATEGORIES": ["circle", "cross_base"],
-        "WIDTH":            48,
-        "SMOOTH_SIGMA":     0.0,
-    },
-    "fno_baseline_old": {
-        "MODEL_NAME":       "fno_baseline",
-        "SAVE_DIR":         _abs("../checkpoints/fno_baseline_old"),
-        "DATA_DIR":         _abs("../data/em_data"),
-        "OUT_CHANNELS":     6,
-        "TRAIN_FREQS":      None,
-        "TRAIN_CATEGORIES": ["circle", "cross_base"],
-        "WIDTH":            48,
-        "SMOOTH_SIGMA":     0.0,
-    },
-
     # FNO + FiLM：有条件编码器，但用简单 scale+shift 代替动态投影矩阵
     "fno_film": {
         "MODEL_NAME": "fno_film",

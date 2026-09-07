@@ -1,13 +1,7 @@
 """
 电磁场多频点数据集
 
-数据结构 v1（旧）：
-  data/em_data/<category>/<sample>/
-    patch_plane.npy       (65, 65, 2)  ch0=SDF, ch1=二值掩码
-    field_slice/*_<freq>GHz.npy  (65, 65, 8)
-      通道：[x, y, ex_r, ex_i, ey_r, ey_i, ez_r, ez_i]
-
-数据结构 v2（新）：
+数据结构（v2，当前唯一数据）：
   data/data/<category>/<sample>/
     patch_plane.npy       (64, 64, 2)
     field_volume_merged.npy  (9, 22, 64, 64, 12)
@@ -17,7 +11,7 @@
       axis4: 12 通道 (Ex_r,Ex_i, Ey_r,Ey_i, Ez_r,Ez_i, Hx_r,Hx_i, Hy_r,Hy_i, Hz_r,Hz_i)
       → 按归一化距离 d/λ 插值后取电场前 6 通道作为输出
 
-输入：(2, H, W)  输出：(6, H, W) = [ex_r, ex_i, ey_r, ey_i, ez_r, ez_i]
+输入：(2, H, W)  输出：(12, H, W) = Ex/Ey/Ez/Hx/Hy/Hz 各实部+虚部
 附加：freq (1,) 归一化频率 [0,1]
 """
 
@@ -71,7 +65,7 @@ def get_type_index(type_name):
 class EMMultiFreqDataset(Dataset):
     def __init__(
         self,
-        data_dir: str = "data/em_data",
+        data_dir: str = "data/data",
         target_freq: str = None,
         output_field: str = "all",
         normalize: bool = False,

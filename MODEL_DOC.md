@@ -49,9 +49,6 @@ data/data/<category>/<sample>/
 | square_ring | 200 | 9 | 1800 |
 | **合计** | **1000** | **9** | **9000** |
 
-旧数据集 `data/em_data/`（circle / cross_base，65×65，6 通道电场）仍保留，仅供
-`fno_attention_old` / `fno_baseline_old` 等历史实验使用。
-
 ### 数据格式分支（`data/dataset.py`）
 
 - `v2_cache`：读 `field_plane_d0.10.npy`，按频点直接索引（无 z 相邻层）
