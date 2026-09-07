@@ -4,6 +4,7 @@
 # 1) 数据与划分
 # =============================================================================
 import os
+import multiprocessing
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 默认值，具体实验在 experiment_config.py 里覆盖
@@ -182,6 +183,8 @@ try:
         globals()[_k] = _v
     # 依赖 SAVE_DIR 的派生变量需要重新计算
     OUTPUT_NORM_STATS_PATH = f"{SAVE_DIR}/output_norm_stats.npz"
-    print(f"[Config] 当前实验: {ACTIVE_EXPERIMENT}  保存路径: {SAVE_DIR}")
+    # DataLoader worker 子进程（Windows spawn）会重新导入本模块，避免重复刷屏
+    if multiprocessing.current_process().name == "MainProcess":
+        print(f"[Config] 当前实验: {ACTIVE_EXPERIMENT}  保存路径: {SAVE_DIR}")
 except ImportError:
     pass
