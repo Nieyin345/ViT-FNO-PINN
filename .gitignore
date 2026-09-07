@@ -1,9 +1,28 @@
 # 数据文件（太大，不推）
 data/em_data_meep/
+data/em_data/
+data/data/
+data/blank/
 *.npy
+*.npz
 
-# 模型权重
+# 模型权重（含子目录）
 checkpoints/*.pth
+checkpoints/**/*.pth
+
+# HFSS 场文件（单文件几十 MB）
+*.fld
+
+# 本地 Python 环境
+**/.venv/
+venv/
+
+# 本地工具目录（个人配置，不进版本库）
+.kiro/
+.vscode/
+
+# 传播工具输出
+field2field/out_result/
 
 # Python 缓存
 __pycache__/
@@ -15,7 +34,10 @@ __pycache__/
 *.tar.gz
 cloudflared
 vscode_cli*
+*.log
 
 # 系统文件
 .DS_Store
 Thumbs.db
+
+propagation/

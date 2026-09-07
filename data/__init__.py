@@ -1,2 +1,5 @@
-from .dataset import EMDataset
-from .splits import get_splits, get_stratified_splits
+from .dataset import EMMultiFreqDataset
+from .dataset_multiplane import MultiplaneScatterDataset
+from .dataset_propagator import PropagatorDataset
+
+__all__ = ["EMMultiFreqDataset", "MultiplaneScatterDataset", "PropagatorDataset"]
