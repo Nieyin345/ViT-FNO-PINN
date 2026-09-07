@@ -4,6 +4,7 @@
 
 1. **patch2field**：用 FNO（Fourier Neural Operator）从贴片几何（SDF + Mask）预测**近场截面**的场分布（12 通道：Ex/Ey/Ez + Hx/Hy/Hz 的实部虚部）。
 2. **field2field**：用物理传播（PWS / 角谱法，E+H 双向）把单个截面的散射场传播到任意 z 位置，重建整个空气盒子的三维场分布。
+   端到端衔接脚本：`field2field/propagate_fno_prediction.py`（FNO 预测 0.1λ 散射场平面 → PWS 传播到任意 z → 加回背景场得总场，并可与仿真体数据对比）。
 
 ```
 贴片形状 (SDF+Mask) ──FNO──► 近场截面场 (z=0.1λ)
@@ -157,10 +158,12 @@ fno_baseline_parity(参数量对齐~8M) / fno_lora / fno_film / unet`，保存�
 
 `train.py` 保存的 `.pth` 包含：`epoch / model_state_dict / optimizer_state_dict /
 val_loss / val_rel / val_geom / use_output_standardization`，标准化开启时含
-`output_norm_mean / output_norm_std`。`train_multiplane.py` 保存 `use_output_standardization=False`
-且不包含统计量（其数据未标准化）。
+`output_norm_mode` 与对应参数（zscore: mean/std；log: scale/logmean/logstd）。
+`val_rel / val_geom` 为**物理空间**指标（先反归一化再计算），避免 log 归一化空间
+导致方向角/相位失真；训练损失仍在归一化空间计算。`train_multiplane.py` 保存
+`use_output_standardization=False` 且不包含统计量（其数据未标准化）。
 
-`output_norm_stats.npz` 保存于各实验目录，便于离线评估反标准化。
+`output_norm_stats.npz` 保存于各实验目录（含模式与参数），便于离线评估反标准化。
 
 ### ⚠️ checkpoint 与代码架构差异
 
@@ -193,3 +196,5 @@ val_loss / val_rel / val_geom / use_output_standardization`，标准化开启时
 | `field2field/` | PWS 传播工具（.fld 读写、传播、可视化） |
 | `LOSS_DESIGN.md` | 自适应权重损失设计（计划中，未实现） |
 | `requirements.txt` | 依赖清单 |
+
+

@@ -56,7 +56,10 @@ python patch2field/eval_generalization.py
 # 交互式评估 UI
 python patch2field/ui_eval.py
 
-# PWS 传播：从截面场计算全空间（用法见 field2field/README.md）
+# 端到端：FNO 预测近场截面 → PWS 传播到全空间（可对比仿真体数据）
+python field2field/propagate_fno_prediction.py --sample-dir data/data/circle/circle_1 --freq-ghz 12 --ckpt checkpoints/fno_attention/best.pth --targets-mm 5,7,9,11,13,15,17,19,21,23 --out-dir out_fno_prop
+
+# PWS 传播：从 HFSS 截面场计算全空间（用法见 field2field/README.md）
 python field2field/propagate_scatter.py --source-z-mm 3 --targets-mm 5,7,9 --freq-ghz 12
 ```
 
@@ -67,4 +70,5 @@ python field2field/propagate_scatter.py --source-z-mm 3 --targets-mm 5,7,9 --fre
 - 训练类别默认 `circle/circle_ring/cross/square_ring`（rectangle 留作形状泛化评估，数据目录 `1_rectangle`），见 `patch2field/config.py`
 - `checkpoints/fno_attention/` 是旧架构产物，重新训练前评估结果仅供参考（详见 `MODEL_DOC.md`）
 - 详细架构、损失与配置见 `MODEL_DOC.md`
+
 

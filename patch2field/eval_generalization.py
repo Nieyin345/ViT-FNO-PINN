@@ -163,41 +163,56 @@ def main():
 
     loader = DataLoader(dataset, batch_size=8, shuffle=False, num_workers=0)
 
+    # ── 参数量说明 ──────────────────────────────────────
+    # fno_attention(w64,m8,5层) ≈ 8.05M；fno_baseline_large(w72) ≈ 3.35M；
+    # fno_baseline_parity(w112) ≈ 8.10M（与主模型同量级，推荐作为公平对比基线）
+    print("\n参数量：fno_attention≈8.05M, fno_baseline_large≈3.35M, fno_baseline_parity≈8.10M")
+
     # ── 主模型 ──────────────────────────────────────────
-    print("\n加载主模型 (fno_attention)...")
     ckpt_attn = "../checkpoints/fno_attention/best.pth"
+    print("\n加载主模型 (fno_attention)...")
     model_attn = load_model(FNO2d, ckpt_attn)
 
     # ── 基线模型 ─────────────────────────────────────────
-    print("\n加载基线模型 (fno_baseline_large)...")
-    ckpt_base = "../checkpoints/fno_baseline_large/best.pth"
-    model_base = load_model(FNO2dBaseline, ckpt_base)
+    candidates = [
+        ("fno_baseline_large", "../checkpoints/fno_baseline_large/best.pth", FNO2dBaseline),
+        ("fno_baseline_parity", "../checkpoints/fno_baseline_parity/best.pth", FNO2dBaseline),
+    ]
+    entries = [("fno_attention", model_attn, ckpt_attn)]
+    for name, ckpt, cls in candidates:
+        if os.path.exists(ckpt):
+            print(f"\n加载基线模型 ({name})...")
+            entries.append((name, load_model(cls, ckpt), ckpt))
+        else:
+            print(f"\n[跳过] {name} checkpoint 不存在（{ckpt}），仅保留 baseline_large")
 
-    # ── 读取各自的归一化统计量 ──────────────────────────
+    # ── 读取各自的归一化统计量并评估 ─────────────────────
     def load_normalizer(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
         return OutputNormalizer.from_checkpoint(ckpt)
 
-    # ── 评估 ─────────────────────────────────────────────
     print("\n开始评估...")
-    norm_attn = load_normalizer(ckpt_attn)
-    norm_base = load_normalizer(ckpt_base)
-
-    g_attn, r_attn = evaluate(model_attn, loader, ckpt_attn, "fno_attention",    norm_attn)
-    g_base, r_base = evaluate(model_base, loader, ckpt_base, "fno_baseline_large", norm_base)
+    results = []
+    for name, model, ckpt in entries:
+        g, r = evaluate(model, loader, ckpt, name, load_normalizer(ckpt))
+        results.append((name, g, r))
 
     # ── 汇总 ─────────────────────────────────────────────
     print("\n" + "=" * 55)
     print("汇总对比（rectangle 形状泛化）")
     print(f"{'模型':<20} {'Geom Loss':>12} {'Rel L2':>10}")
     print("-" * 45)
-    print(f"{'fno_attention':<20} {g_attn:>12.4f} {r_attn:>10.4f}")
-    print(f"{'fno_baseline_large':<20} {g_base:>12.4f} {r_base:>10.4f}")
-    print("-" * 45)
-    print(f"{'ratio (attn/base)':<20} {g_attn/g_base:>12.3f}x {r_attn/r_base:>10.3f}x")
+    for name, g, r in results:
+        print(f"{name:<20} {g:>12.4f} {r:>10.4f}")
+    if len(results) >= 2:
+        base_name, base_g, base_r = results[1]
+        g0, r0 = results[0][1], results[0][2]
+        print("-" * 45)
+        print(f"{'ratio (attn/base)':<20} {g0/base_g:>12.3f}x {r0/base_r:>10.3f}x")
     print("=" * 55)
     print("< 1.0 表示主模型更好，> 1.0 表示基线更好")
 
 
 if __name__ == "__main__":
     main()
+

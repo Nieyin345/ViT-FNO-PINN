@@ -493,13 +493,17 @@ class Trainer:
         return loss
 
     def rel_l2_error(self, pred, true):
-        return self.channel_mean_rel_l2_error(pred, true)
+        """物理空间逐通道相对 L2（先反归一化，避免 log 归一化空间失真）。"""
+        return self.channel_mean_rel_l2_error(self._denorm_output(pred),
+                                              self._denorm_output(true))
 
     def geom_metric(self, pred, true):
-        """用 geom 损失作为保存指标（方向角+相位+幅值综合评估）"""
-        v_e, _ = field_geom_loss(pred[:, :6], true[:, :6])
-        if pred.shape[1] >= 12:
-            v_h, _ = field_geom_loss(pred[:, 6:12], true[:, 6:12])
+        """物理空间 geom 误差（方向角+相位+幅值），用作保存/早停指标。"""
+        pred_p = self._denorm_output(pred)
+        true_p = self._denorm_output(true)
+        v_e, _ = field_geom_loss(pred_p[:, :6], true_p[:, :6])
+        if pred_p.shape[1] >= 12:
+            v_h, _ = field_geom_loss(pred_p[:, 6:12], true_p[:, 6:12])
             return (v_e + v_h) * 0.5
         return v_e
 
@@ -660,3 +664,4 @@ class Trainer:
 
 if __name__ == "__main__":
     Trainer().run()
+
