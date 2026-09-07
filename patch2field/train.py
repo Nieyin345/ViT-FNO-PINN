@@ -604,7 +604,8 @@ class Trainer:
             tag = " [BEST]" if is_best else ""
             print(f"Epoch {epoch}/{C.N_EPOCHS}  "
                   f"Loss(train/val): {train_loss:.4f}/{val_loss:.4f}  "
-                  f"Geom(train/val): {train_save_rel:.4f}/{val_save_rel:.4f}{tag}")
+                  f"Geom(train/val): {train_save_rel:.4f}/{val_save_rel:.4f}  "
+                  f"RelL2(train/val): {train_rel:.4f}/{val_rel:.4f}{tag}")
 
             # 始终保存最新权重，便于中断恢复与回看最近状态
             latest_every = int(getattr(C, "SAVE_LATEST_EVERY", 1))
