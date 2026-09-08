@@ -547,7 +547,6 @@ class Trainer:
                         new_freq[b] = alpha * freq[b] + (1 - alpha) * freq_b.view_as(freq[b])
                 tgt  = new_tgt
                 freq = new_freq
-
             pred = self.model(inp, freq)
             loss = self.loss_fn(pred, tgt, epoch=epoch, batch=batch)
             

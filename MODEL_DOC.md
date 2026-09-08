@@ -70,7 +70,7 @@ data/data/<category>/<sample>/
 输入 x (B, 2, 64, 64) + freq (B, 1)
     │
     ├── FourierFreqEncoder(freq) ──► freq_emb (B, 32)
-    └── SDFGeomEncoder(x)        ──► geom_emb (B, 32)   # SDF 的低频 FFT 幅度特征
+    └── SDFGeomEncoder(x)        ──► geom_emb (B, 32)   # SDF 的低频 FFT 谱特征（实部+虚部）
     │
     ▼ Lift: Conv2d(2→64, 1×1) + GELU
     ▼ pad +7px

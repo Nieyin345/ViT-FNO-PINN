@@ -14,7 +14,7 @@ class FNOBlock(nn.Module):
 
     def forward(self, x, freq_emb=None, geom_emb=None):
         out = self.spectral(x, freq_emb, geom_emb) + self.bypass(x)
-        return nn.functional.gelu(self.norm(out))
+        return nn.functional.gelu(self.norm(out + x))
 
 
 class FNO2d(FNOBase):

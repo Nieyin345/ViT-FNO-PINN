@@ -29,7 +29,7 @@ class SDFGeomEncoder(nn.Module):
     def __init__(self, n_modes: int = 4, out_dim: int = 32):
         super().__init__()
         self.n_modes = n_modes
-        feat_dim = n_modes * n_modes
+        feat_dim = n_modes * n_modes * 2  # 实部 + 虚部
         self.mlp = nn.Sequential(
             nn.Linear(feat_dim, 64), nn.GELU(),
             nn.Linear(64, out_dim)
@@ -38,8 +38,8 @@ class SDFGeomEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         sdf = x[:, 0:1, :, :]
         sdf_ft = torch.fft.rfft2(sdf.squeeze(1))
-        mag = sdf_ft[:, :self.n_modes, :self.n_modes].abs()
-        feat = mag.reshape(mag.size(0), -1)
+        spec = sdf_ft[:, :self.n_modes, :self.n_modes]
+        feat = torch.cat([spec.real, spec.imag], dim=1).reshape(spec.size(0), -1)
         return self.mlp(feat)
 
 
