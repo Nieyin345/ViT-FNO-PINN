@@ -530,7 +530,10 @@ class EvalApp:
             freq_val = self.draw_freq_var.get()
             freq_norm = (freq_val - 8.0) / (12.0 - 8.0)
             # 手绘区默认用极化 0；数据评估会使用 dataset 中每条的极化条件。
-            freq = torch.tensor([freq_norm, 0.0], dtype=torch.float32).to(self._device)
+            # 必须带 batch 维：(B, 2) = [归一化频率, 极化]，与 dataset 的契约一致。
+            # 旧代码传 1D `torch.tensor([freq_norm])`，靠编码器里的
+            # `if freq.ndim == 1` 兜底；窄 slice 的模型（fno_v2）会直接报错。
+            freq = torch.tensor([[freq_norm, 0.0]], dtype=torch.float32).to(self._device)
             
             # 因为之前撤销了类别Embedding控制，我们现在直接全靠超网络的 QK 处理形状和频率！
             
@@ -988,10 +991,15 @@ class EvalApp:
                 
                 self.update_progress(70)
                 
-                # 加载模型（根据 experiment_config 自动选择模型类型）
-                self._model = _build_model().to(self._device)
+                # 加载模型：**以 checkpoint 为准**。只有在没给 checkpoint 时才按
+                # 当前 config 建一个随机初始化模型（便于先看数据和界面）。
+                # 旧实现在这里无条件先建一个 config 模型、随后被 checkpoint 覆盖，
+                # 于是日志里会先打印一个与实际无关的参数量，白分配一次显存。
+                ckpt_path = self.ckpt_var.get()
+                if not ckpt_path or not os.path.exists(ckpt_path):
+                    self._model = _build_model().to(self._device)
 
-                ckpt_meta = self._load_checkpoint_robust(self.ckpt_var.get())
+                ckpt_meta = self._load_checkpoint_robust(ckpt_path)
                 self._ckpt_meta = ckpt_meta
                 self._model.eval()
                 self.update_progress(100)

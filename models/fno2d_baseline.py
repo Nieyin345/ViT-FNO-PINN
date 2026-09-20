@@ -87,8 +87,7 @@ class FNO2dBaseline(FNOBase):
         B, _, H, W = x.shape
         if freq is None:
             return torch.zeros(B, self.cond_channels, H, W, device=x.device, dtype=x.dtype)
-        if freq.dim() == 1:
-            freq = freq.unsqueeze(1)
+        # freq 已由 FNOBase.forward 里的 normalize_freq 规范成 (B, 2)
         n_cond = freq.shape[1]
         if n_cond < self.cond_channels:
             pad = torch.zeros(B, self.cond_channels - n_cond, device=x.device, dtype=x.dtype)

@@ -50,6 +50,34 @@ class Cond:
         return self.freq_emb is None and self.geom_emb is None and self.pol_emb is None
 
 
+def normalize_freq(freq: Optional[torch.Tensor], batch_size: int) -> Optional[torch.Tensor]:
+    """把 `freq` 规范成 (B, 2) = [归一化频率, 极化]。
+
+    权威契约来自 `data/dataset.py`：每条样本给出 (2,)，DataLoader 批成 (B, 2)。
+    但手绘推理等路径历史上传过 1D（`torch.tensor([freq_norm])` 或
+    `[freq_norm, pol]`），缺 batch 维。窄 slice 的模型（FNO2dV2 的 `freq[:, 1:2]`）
+    会直接 IndexError，宽 slice 的模型则靠广播"侥幸跑通"——同一个 bug 时隐时现。
+
+    这里统一补齐：1D 视为**单样本**，补成 (1, 2)；缺极化列时补 0（极化 0）。
+    已是 (B, 2) 的原样返回，不改动正常路径的数值。
+    """
+    if freq is None:
+        return None
+    if freq.dim() == 1:
+        freq = freq.unsqueeze(0)
+    elif freq.dim() > 2:
+        raise ValueError(f"freq 维度应 <= 2，收到 shape={tuple(freq.shape)}")
+    if freq.shape[0] != batch_size:
+        raise ValueError(
+            f"freq 的 batch 维 ({freq.shape[0]}) 与输入 x ({batch_size}) 不一致；"
+            f"freq.shape={tuple(freq.shape)}"
+        )
+    if freq.shape[1] < 2:
+        pad = freq.new_zeros(freq.shape[0], 2 - freq.shape[1])
+        freq = torch.cat([freq, pad], dim=1)
+    return freq
+
+
 class FNOBase(nn.Module):
     """FNO 抽象基类：统一 Lift 提升、Padding、Block 级联、头输出。
 
@@ -87,6 +115,7 @@ class FNOBase(nn.Module):
 
     # ----------------------------------------------------------------- 前向
     def forward(self, x: torch.Tensor, freq: Optional[torch.Tensor] = None) -> torch.Tensor:
+        freq = normalize_freq(freq, x.shape[0])
         x_in = self.build_input(x, freq)
         cond = self.build_cond(x, freq)
 

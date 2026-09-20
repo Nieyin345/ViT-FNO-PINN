@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from core.base import normalize_freq
 from core.config import ModelConfig
 from core.registry import register
 
@@ -72,8 +73,7 @@ class UNet2d(nn.Module):
         B, _, H, W = x.shape
         if freq is None:
             return torch.zeros(B, self.cond_channels, H, W, device=x.device, dtype=x.dtype)
-        if freq.dim() == 1:
-            freq = freq.unsqueeze(1)
+        # freq 已由 normalize_freq 规范成 (B, 2)；此处只做通道数与空间广播
         n_cond = freq.shape[1]
         if n_cond < self.cond_channels:
             pad = torch.zeros(B, self.cond_channels - n_cond, device=x.device, dtype=x.dtype)
@@ -83,6 +83,7 @@ class UNet2d(nn.Module):
 
     def forward(self, x, freq=None):
         B, C, H, W = x.shape
+        freq = normalize_freq(freq, B)
         cond_map = self._broadcast_condition(x, freq)
         x = torch.cat([x, cond_map], dim=1)
 
