@@ -1,13 +1,36 @@
 # -*- coding: utf-8 -*-
-"""全频点电磁场训练脚本"""
+"""全频点电磁场训练脚本。
 
+用法（在仓库根执行）：
+    python -m tools.train                              # 用 configs/base.py 的默认实验
+    python -m tools.train --experiment fno_v2          # 用某个预设实验
+    python -m tools.train --model fno_v2 --width 32 --layers 3 --epochs 20 --tag smoke
+    python -m tools.train --list-models
+    python -m tools.train --list-experiments
+
+重构变更：
+  - 删掉 `MODEL_REGISTRY` 与 `if model_name == ...` 三个 kwargs 分支，改为
+    `core.registry.build_model(name, cfg)`；模型集合由各模型文件自注册决定。
+  - 删除 `TRANSFORMER_*` 环境变量注入路径，改为 argparse。
+  - 保存改走 `core.checkpoint.save()`，checkpoint 内嵌 `model_config`，
+    加载时 `strict=True`（架构不符直接报错，不再静默降级）。
+  - 修复一处现存 bug：`fno_v2 + KERNEL_COND_MODE="lora"` 时 `lora_rank` 从未
+    从配置传入，永远用默认 4，使 `fno_v2_lora` 实验里设的 `LORA_RANK=8` 被静默
+    忽略。统一到 `ModelConfig` 后自然修复。
+"""
+
+import argparse
 import os
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-import torch
+# 允许 `python tools/train.py` 直接执行（`python -m tools.train` 不依赖这行）
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import numpy as np
+import torch
 from tqdm import tqdm
 from collections import defaultdict
 from torch.utils.data import DataLoader, Subset
@@ -21,23 +44,86 @@ except Exception:
     plt = None
     HAS_MATPLOTLIB = False
 
+import models  # noqa: F401  触发所有模型自注册
+from core import checkpoint as CK
+from core.config import ModelConfig
+from core.registry import available as available_models, build_model
+from configs import base as C
 from data.dataset import EMMultiFreqDataset
-from models.fno2d import FNO2d
-from models.fno2d_baseline import FNO2dBaseline
-from models.fno2d_film import FNO2dFiLM
-from models.unet2d import UNet2d
-from models.fno2d_lora import FNO2dLoRA
-from models.losses import field_rel_l2_loss, field_geom_loss, freq_band_loss, dc_ac_rel_loss, dc_ac_directional_mean_loss, highfreq_suppress_loss
-import config as C
+from models.losses import (
+    field_rel_l2_loss, field_geom_loss, freq_band_loss, dc_ac_rel_loss,
+    dc_ac_directional_mean_loss, highfreq_suppress_loss, e_h_total_rel_l2,
+    channel_group_balanced_l2,
+)
 
-# 模型注册表，新增对比模型在这里加一行
-MODEL_REGISTRY = {
-    "fno_attention": FNO2d,
-    "fno_baseline":  FNO2dBaseline,
-    "fno_film":      FNO2dFiLM,
-    "unet":          UNet2d,
-    "fno_lora":      FNO2dLoRA,
-}
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="训练电磁场预测模型",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    g = p.add_argument_group("模型与实验")
+    g.add_argument("--model", "-m", default=None,
+                   help="模型注册名，覆盖实验/配置里的设置")
+    g.add_argument("--experiment", "-e", default=None,
+                   help="configs/experiments.py 里的实验名（自动套用其覆盖项）")
+    g.add_argument("--width", type=int, default=None)
+    g.add_argument("--layers", type=int, default=None)
+    g.add_argument("--modes", type=int, default=None, help="同时设置 modes1/modes2")
+    g.add_argument("--head", default=None, choices=["single", "em_split"])
+    g.add_argument("--kernel-cond", default=None, choices=["film", "lora", "none"],
+                   help="仅对 fno_v2 生效")
+    g.add_argument("--lora-rank", type=int, default=None)
+
+    g = p.add_argument_group("训练")
+    g.add_argument("--epochs", type=int, default=None)
+    g.add_argument("--batch-size", type=int, default=None)
+    g.add_argument("--lr", type=float, default=None)
+    g.add_argument("--num-workers", type=int, default=None,
+                   help="DataLoader worker 数（Windows 上调低可加速小数据调试）")
+    g.add_argument("--seed", type=int, default=None, help="随机种子（默认用配置里的）")
+    g.add_argument("--device", default=None, help="cuda / cpu（默认自动判断）")
+    g.add_argument("--loss-space", default=None, choices=["physical", "normalized"])
+
+    g = p.add_argument_group("输出")
+    g.add_argument("--tag", default=None,
+                   help="结果目录名。保存到 <save_root>/<tag>/，默认用实验名")
+    g.add_argument("--save-root", default=None, help="结果根目录，默认 checkpoints/")
+    g.add_argument("--save-dir", default=None, help="直接指定完整保存目录（优先于 --tag）")
+
+    g = p.add_argument_group("查询")
+    g.add_argument("--list-models", action="store_true", help="列出已注册模型后退出")
+    g.add_argument("--list-experiments", action="store_true", help="列出预设实验后退出")
+    return p.parse_args(argv)
+
+
+def apply_cli_overrides(args):
+    """把命令行参数写进 configs.base 的全局命名空间（下游都是 getattr(C, ...) 实时读）。"""
+    if args.experiment:
+        C.apply_experiment(args.experiment)
+
+    simple = {
+        "WIDTH": args.width, "N_LAYERS": args.layers,
+        "N_EPOCHS": args.epochs, "BATCH_SIZE": args.batch_size,
+        "LR": args.lr, "SHUFFLE_SEED": args.seed,
+        "NUM_WORKERS": args.num_workers,
+        "LORA_RANK": args.lora_rank, "HEAD_MODE": args.head,
+        "KERNEL_COND_MODE": args.kernel_cond, "LOSS_SPACE": args.loss_space,
+    }
+    for key, val in simple.items():
+        if val is not None:
+            setattr(C, key, val)
+    if args.modes is not None:
+        C.MODES1 = C.MODES2 = args.modes
+    if args.model is not None:
+        C.model = args.model
+    if args.save_dir is not None:
+        C.SAVE_DIR = os.path.abspath(args.save_dir)
+    elif args.save_root is not None or args.tag is not None:
+        root = os.path.abspath(args.save_root) if args.save_root else os.path.dirname(
+            C.get("SAVE_DIR") or os.path.join(_ROOT, "checkpoints"))
+        name = args.tag or C.ACTIVE_EXPERIMENT
+        C.SAVE_DIR = os.path.join(root, name)
 
 
 def build_split(dataset):
@@ -84,8 +170,11 @@ def build_split(dataset):
 
 
 class Trainer:
-    def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self, device_override=None):
+        if device_override:
+            self.device = torch.device(device_override)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[Trainer] 设备: {self.device}")
         os.makedirs(getattr(C, "SAVE_DIR", "checkpoints"), exist_ok=True)
         if not HAS_MATPLOTLIB:
@@ -104,6 +193,7 @@ class Trainer:
             smooth_sigma=getattr(C, "SMOOTH_SIGMA", 0.0),
             use_scatter=getattr(C, "USE_SCATTER_FIELD", False),
             bg_params_path=getattr(C, "BACKGROUND_PARAMS_PATH", "data/blank/background_params.npz"),
+            polarizations=getattr(C, "DATASET_POLARIZATIONS", None),
         )
 
         # 按类别过滤
@@ -129,7 +219,7 @@ class Trainer:
         from collections import defaultdict
         full_dataset.shape_to_indices = defaultdict(list)
         for i, s in enumerate(full_dataset.samples):
-            full_dataset.shape_to_indices[(s["category"], s["name"])].append(i)
+            full_dataset.shape_to_indices[(s["category"], s["name"], s.get("polarization", 0))].append(i)
 
         self.use_output_norm = bool(getattr(C, "USE_OUTPUT_STANDARDIZATION", False))
         self.output_norm_mode = str(getattr(C, "OUTPUT_NORM_MODE", "zscore")).lower()
@@ -184,20 +274,19 @@ class Trainer:
             num_workers=C.NUM_WORKERS, pin_memory=C.PIN_MEMORY
         )
 
-        model_name = getattr(C, "MODEL_NAME", "fno_attention")
-        model_cls = MODEL_REGISTRY.get(model_name)
-        if model_cls is None:
-            raise ValueError(f"未知模型: {model_name}，可选: {list(MODEL_REGISTRY.keys())}")
-        kwargs = dict(
-            modes1=C.MODES1, modes2=C.MODES2, width=C.WIDTH,
-            n_layers=C.N_LAYERS, out_channels=getattr(C, "OUT_CHANNELS", 6),
-        )
-        if model_name == "fno_lora":
-            kwargs["lora_rank"] = getattr(C, "LORA_RANK", 4)
-        self.model = model_cls(**kwargs).to(self.device)
+        # 模型：由 configs/base.py 的全局值构造出唯一的 ModelConfig，再交给注册表。
+        # 所有模型统一签名 __init__(cfg: ModelConfig)，无需按名字分支拼 kwargs。
+        self.model_name = C.model_name_from_globals()
+        self.model_cfg = C.model_config_from_globals()
+        self.model = build_model(self.model_name, self.model_cfg).to(self.device)
 
         n_params = sum(p.numel() for p in self.model.parameters())
-        print(f"[模型] 参数量: {n_params:,}")
+        self.n_params = int(n_params)
+        print(f"[模型] {self.model_name}  参数量: {n_params:,}")
+        print(f"[模型] cfg: width={self.model_cfg.width} layers={self.model_cfg.n_layers} "
+              f"modes={self.model_cfg.modes1}x{self.model_cfg.modes2} "
+              f"head={self.model_cfg.head} kernel_cond={self.model_cfg.kernel_cond} "
+              f"lora_rank={self.model_cfg.lora_rank}")
 
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=C.LR, weight_decay=C.WEIGHT_DECAY
@@ -214,6 +303,7 @@ class Trainer:
 
         self.history = {"train": [], "val": []}
         self.best_val = float("inf")
+        self.best_epoch = 0
         self.patience = 0
         self.only_save_pth = bool(getattr(C, "ONLY_SAVE_PTH", False))
         if self.only_save_pth:
@@ -397,26 +487,38 @@ class Trainer:
     def loss_fn(self, pred, true, epoch=1, batch=None):
         """
         向量化损失组合（顺序见 config.py 的 LOSS_VECTOR_ORDER 说明）：
-        0: 总场相对L2
+        0: E/H 分组总场相对L2（physical）/ 总场相对L2（normalized）
         1: 三方向幅值DC/AC
-        2: 全场几何损失
-        3: 6通道DC/AC（实虚部）
+        2: 全场几何损失（E+H 平均）
+        3: 12通道DC/AC（稳定版）
         4: 低频频谱约束
         5: 高频抑制
-        6: 6通道DC/AC（原始）
-        7: 6通道逐通道相对L2均值（SaveRel6口径）
+        6: 12通道DC/AC（原始）
+        7: 逐通道分组相对L2均值（physical）/ 逐通道相对L2均值（normalized）
         8: 麦克斯韦残差约束 (PINN Loss)
         """
         w = self._get_effective_loss_weight_vector(epoch)
         loss = pred.new_tensor(0.0)
 
-        # 12 通道时，电场相关 loss 只取前 6 通道（Ex/Ey/Ez）
-        pred_e = pred[:, :6]
-        true_e = true[:, :6]
+        loss_space = str(getattr(C, "LOSS_SPACE", "physical")).lower()
+        if loss_space == "physical" and self._denorm_tp is not None:
+            pred_w = self._denorm_output(pred)
+            true_w = self._denorm_output(true)
+        else:
+            pred_w = pred
+            true_w = true
 
-        # 0) 总场相对L2
+        # 12 通道时，电场相关 loss 只取前 6 通道（Ex/Ey/Ez）
+        pred_e = pred_w[:, :6]
+        true_e = true_w[:, :6]
+
+        # 0) E/H 分组总场相对L2（物理空间平衡 422:1 量级差）
         if w[0] != 0.0:
-            loss = loss + w[0] * field_rel_l2_loss(pred_e, true_e)
+            h_boost = float(getattr(C, "FIELD_H_GROUP_WEIGHT", 1.0))
+            if loss_space == "physical" and self._denorm_tp is not None:
+                loss = loss + w[0] * e_h_total_rel_l2(pred_w, true_w, h_boost=h_boost)
+            else:
+                loss = loss + w[0] * field_rel_l2_loss(pred_e, true_e)
 
         # 1) 三方向幅值DC/AC
         if w[1] != 0.0:
@@ -427,20 +529,19 @@ class Trainer:
             )
             loss = loss + w[1] * v
 
-        # 2) 全场几何（归一化空间计算，避免 E/H 量级差异导致梯度失衡）
+        # 2) 全场几何（E/H 各自算再平均；方向角/相位天然尺度不变）
         if w[2] != 0.0:
-            # 电场 geom loss（前 6 通道，归一化空间）
             v_e, _ = field_geom_loss(
-                pred[:, :6], true[:, :6],
+                pred_w[:, :6], true_w[:, :6],
                 w_dir=float(getattr(C, "FIELD_DIR_ANGLE_WEIGHT", 1.0)),
                 w_phase=float(getattr(C, "FIELD_COMPLEX_PHASE_WEIGHT", 1.0)),
                 w_mag=float(getattr(C, "FIELD_TOTAL_MAG_WEIGHT", 1.0)),
             )
             v = v_e
-            # 磁场 geom loss（后 6 通道，归一化空间，仅 12 通道时生效）
-            if pred.shape[1] >= 12:
+            # 磁场 geom loss（后 6 通道，仅 12 通道时生效）
+            if pred_w.shape[1] >= 12:
                 v_h, _ = field_geom_loss(
-                    pred[:, 6:12], true[:, 6:12],
+                    pred_w[:, 6:12], true_w[:, 6:12],
                     w_dir=float(getattr(C, "FIELD_DIR_ANGLE_WEIGHT", 1.0)),
                     w_phase=float(getattr(C, "FIELD_COMPLEX_PHASE_WEIGHT", 1.0)),
                     w_mag=float(getattr(C, "FIELD_TOTAL_MAG_WEIGHT", 1.0)),
@@ -448,7 +549,7 @@ class Trainer:
                 v = (v_e + v_h) * 0.5
             loss = loss + w[2] * v
 
-        # 3) 通道DC/AC（稳定版，全通道）
+        # 3) 通道DC/AC（稳定版，归一化空间）
         if w[3] != 0.0:
             loss = loss + w[3] * self.complex_channel_rel_error(pred, true)
 
@@ -473,9 +574,13 @@ class Trainer:
             )
             loss = loss + w[6] * v
 
-        # 7) 逐通道相对L2均值（全通道，与 geom_metric 口径对齐）
+        # 7) 逐通道分组相对L2均值（物理空间 E/H 平衡 / 归一化空间逐通道均值）
         if len(w) > 7 and w[7] != 0.0:
-            loss = loss + w[7] * self.channel_mean_rel_l2_error(pred, true)
+            if loss_space == "physical" and self._denorm_tp is not None:
+                h_boost = float(getattr(C, "FIELD_H_GROUP_WEIGHT", 1.0))
+                loss = loss + w[7] * channel_group_balanced_l2(pred_w, true_w, h_boost=h_boost)
+            else:
+                loss = loss + w[7] * self.channel_mean_rel_l2_error(pred, true)
 
         # 8) PINN 麦克斯韦残差损失 (使用相邻平面的真实场计算精确 z 差分)
         if len(w) > 8 and w[8] != 0.0 and batch is not None and "out_zminus" in batch:
@@ -494,9 +599,17 @@ class Trainer:
         return loss
 
     def rel_l2_error(self, pred, true):
-        """物理空间逐通道相对 L2（先反归一化，避免 log 归一化空间失真）。"""
-        return self.channel_mean_rel_l2_error(self._denorm_output(pred),
-                                              self._denorm_output(true))
+        """物理空间逐通道相对 L2（先反归一化，避免 log 归一化空间失真）。
+
+        LOSS_SPACE=physical 时用 E/H 分组平衡口径（对总场最有利）；
+        否则退回旧逐通道均值口径。
+        """
+        pred_p = self._denorm_output(pred)
+        true_p = self._denorm_output(true)
+        loss_space = str(getattr(C, "LOSS_SPACE", "physical")).lower()
+        if loss_space == "physical" and pred_p.shape[1] >= 12:
+            return channel_group_balanced_l2(pred_p, true_p)
+        return self.channel_mean_rel_l2_error(pred_p, true_p)
 
     def geom_metric(self, pred, true):
         """物理空间 geom 误差（方向角+相位+幅值），用作保存/早停指标。"""
@@ -533,7 +646,8 @@ class Trainer:
                 for b in range(inp.shape[0]):
                     cat = batch["category"][b]
                     name = batch["name"][b]
-                    key = (cat, name)
+                    pol = int(batch["pol_idx"][b].item()) if "pol_idx" in batch else 0
+                    key = (cat, name, pol)
                     indices = base_ds.shape_to_indices.get(key, [])
                     if len(indices) >= 2:
                         # 随机取另一个频点
@@ -588,6 +702,16 @@ class Trainer:
         n = len(self.val_loader)
         return total_loss / n, total_rel / n, total_save_rel / n, vis_pred, vis_tgt
 
+    def _save(self, path, epoch, val_loss, val_rel, val_geom):
+        """写出 checkpoint（内嵌 model_config，供 strict=True 加载）。"""
+        return CK.save(
+            path, self.model, self.model_cfg,
+            optimizer=self.optimizer, epoch=epoch,
+            val_loss=val_loss, val_rel=val_rel, val_geom=val_geom,
+            normalizer=self.output_normalizer if self.use_output_norm else None,
+            extra={"experiment": getattr(C, "ACTIVE_EXPERIMENT", None)},
+        )
+
     def run(self):
         print(f"\n{'='*50}\n开始训练 {C.N_EPOCHS} epochs\n{'='*50}\n")
         for epoch in range(1, C.N_EPOCHS + 1):
@@ -609,34 +733,15 @@ class Trainer:
             # 始终保存最新权重，便于中断恢复与回看最近状态
             latest_every = int(getattr(C, "SAVE_LATEST_EVERY", 1))
             if latest_every > 0 and (epoch % latest_every == 0):
-                ckpt = {
-                    "epoch": epoch,
-                    "model_state_dict": self.model.state_dict(),
-                    "optimizer_state_dict": self.optimizer.state_dict(),
-                    "val_loss": val_loss,
-                    "val_rel": val_rel,
-                    "val_geom": val_save_rel,
-                    "use_output_standardization": self.use_output_norm,
-                }
-                if self.use_output_norm:
-                    ckpt.update(self.output_normalizer.to_dict())
-                torch.save(ckpt, f"{C.SAVE_DIR}/latest.pth")
+                self._save(f"{C.SAVE_DIR}/latest.pth", epoch,
+                           val_loss, val_rel, val_save_rel)
 
             if is_best:
                 self.best_val = val_save_rel
+                self.best_epoch = epoch
                 self.patience = 0
-                ckpt = {
-                    "epoch": epoch,
-                    "model_state_dict": self.model.state_dict(),
-                    "optimizer_state_dict": self.optimizer.state_dict(),
-                    "val_loss": val_loss,
-                    "val_rel": val_rel,
-                    "val_geom": val_save_rel,
-                    "use_output_standardization": self.use_output_norm,
-                }
-                if self.use_output_norm:
-                    ckpt.update(self.output_normalizer.to_dict())
-                torch.save(ckpt, f"{C.SAVE_DIR}/best.pth")
+                self._save(f"{C.SAVE_DIR}/best.pth", epoch,
+                           val_loss, val_rel, val_save_rel)
             else:
                 self.patience += 1
                 if self.patience >= C.EARLY_STOP_PATIENCE:
@@ -645,7 +750,38 @@ class Trainer:
 
         if not self.only_save_pth:
             self._save_curve()
-        print(f"\n训练完成！最佳保存指标: {self.best_val:.6f}")
+        print(f"\n训练完成！最佳保存指标: {self.best_val:.6f} (epoch {self.best_epoch})")
+        self.write_summary(val_loss, val_rel, val_save_rel)
+        return {"model": self.model_name, "n_params": self.n_params,
+                "val_geom": self.best_val, "val_rel": val_rel,
+                "best_epoch": self.best_epoch}
+
+    def write_summary(self, val_loss, val_rel, val_geom):
+        """写 summary.json —— tools/compare.py 汇总表的输入。"""
+        import json
+        summary = {
+            "model": self.model_name,
+            "experiment": getattr(C, "ACTIVE_EXPERIMENT", None),
+            "save_dir": C.SAVE_DIR,
+            "n_params": self.n_params,
+            "width": self.model_cfg.width,
+            "n_layers": self.model_cfg.n_layers,
+            "modes1": self.model_cfg.modes1,
+            "modes2": self.model_cfg.modes2,
+            "head": self.model_cfg.head,
+            "kernel_cond": self.model_cfg.kernel_cond,
+            "lora_rank": self.model_cfg.lora_rank,
+            "epochs": C.N_EPOCHS,
+            "best_epoch": self.best_epoch,
+            "val_geom": float(self.best_val),
+            "best_val_loss": float(val_loss),
+            "val_rel": float(val_rel),
+            "model_config": self.model_cfg.to_dict(),
+        }
+        p = os.path.join(C.SAVE_DIR, "summary.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        print(f"[汇总] {p}")
 
     def _save_curve(self):
         if not HAS_MATPLOTLIB:
@@ -663,5 +799,37 @@ class Trainer:
         print(f"[保存] {C.SAVE_DIR}/training_curve.png")
 
 
+def main(argv=None):
+    args = parse_args(argv)
+
+    if args.list_models:
+        print("已注册模型:")
+        for name in available_models():
+            print(f"  {name}")
+        return 0
+
+    if args.list_experiments:
+        from configs.experiments import EXPERIMENTS
+        print("预设实验:")
+        for name, ov in sorted(EXPERIMENTS.items()):
+            model = ov.get("model") or ov.get("MODEL_NAME", "?")
+            print(f"  {name:<28} model={model}")
+        return 0
+
+    apply_cli_overrides(args)
+
+    print(f"[配置] 实验={getattr(C, 'ACTIVE_EXPERIMENT', '-')}  "
+          f"模型={C.model_name_from_globals()}  "
+          f"输出目录={C.SAVE_DIR}")
+
+    seed = int(C.get("SHUFFLE_SEED", 42))
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    trainer = Trainer(device_override=args.device)
+    trainer.run()
+    return 0
+
+
 if __name__ == "__main__":
-    Trainer().run()
+    sys.exit(main())

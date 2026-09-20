@@ -5,8 +5,8 @@
 
 > **⚠️ 本设计文档目前尚未实现。** 代码中没有对应的自适应权重功能；
 > `USE_ADAPTIVE_WEIGHTS` 配置与 `AdaptiveWeights` 空壳类已移除（2026-09 清理）。
-> 若需实现，请以本文档为设计依据，在 `patch2field/models/losses.py` 中
-> 新增权重管理器并接入 `patch2field/train.py` 的 loss_fn。
+> 若需实现，请以本文档为设计依据，在 `models/losses.py` 中
+> 新增权重管理器并接入 `tools/train.py` 的 loss_fn。
 
 
 ## 核心思路

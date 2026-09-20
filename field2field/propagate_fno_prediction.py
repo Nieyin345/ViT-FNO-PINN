@@ -9,15 +9,20 @@
 注意：传播只对散射场做功（总场-背景场），传播后再加回背景场，避免驻波被重复传播。
 
 用法：
-  1) 用 checkpoint 预测 + 传播：
-     python field2field/propagate_fno_prediction.py \
-         --sample-dir data/data/circle/circle_1 --freq-ghz 12 \
-         --ckpt checkpoints/fno_attention/best.pth --model-name fno_attention \
+  1) 用 checkpoint 预测 + 传播（模型类型由 checkpoint 自动判定）：
+     python -m field2field.propagate_fno_prediction \
+         --sample-dir data/data/rectangle/rectangle_1 --freq-ghz 12 \
+         --ckpt checkpoints/fno_attention/best.pth \
          --targets-mm 5,7,9,11,13,15,17,19,21,23 --out-dir out_fno_prop
 
   2) 跳过模型，直接传播一个已算好的散射场平面 (H,W,12)：
-     python field2field/propagate_fno_prediction.py --from-plane plane.npy \
+     python -m field2field.propagate_fno_prediction --from-plane plane.npy \
          --freq-ghz 12 --targets-mm 5,7,9 --out-dir out_fno_prop
+
+重构变更：删掉本地 `_build_registry()`（缺 fno_v2，且未知名字会退回）与
+`from eval_generalization import load_model`（strict=False + 从权重反推结构），
+改为 `core.checkpoint.load`；`use_scatter=True` 的硬编码改为读 config，
+与 train.py 对齐。
 """
 
 import argparse
@@ -27,8 +32,7 @@ from pathlib import Path
 
 _F2F = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_F2F, ".."))
-_P2F = os.path.join(_ROOT, "patch2field")
-for _p in (_F2F, _P2F, _ROOT):
+for _p in (_F2F, _ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -51,22 +55,6 @@ _BLANK_VOLUME = None
 DATA_DIR = os.path.join(_ROOT, "data", "data")
 BG_PARAMS_PATH = os.path.join(_ROOT, "data", "blank", "background_params.npz")
 BLANK_VOLUME_PATH = os.path.join(_ROOT, "data", "blank", "blank", "field_volume_merged.npy")
-
-
-# ---------------- 模型注册（与 patch2field/train.py 的 MODEL_REGISTRY 一致） ----------------
-def _build_registry():
-    from models.fno2d import FNO2d
-    from models.fno2d_baseline import FNO2dBaseline
-    from models.fno2d_film import FNO2dFiLM
-    from models.fno2d_lora import FNO2dLoRA
-    from models.unet2d import UNet2d
-    return {
-        "fno_attention": FNO2d,
-        "fno_baseline":  FNO2dBaseline,
-        "fno_film":      FNO2dFiLM,
-        "unet":          UNet2d,
-        "fno_lora":      FNO2dLoRA,
-    }
 
 
 def _plane_to_em(plane):
@@ -96,7 +84,14 @@ def _wavelength_mm(freq_ghz):
     return C_MM_S / (freq_ghz * 1e9)
 
 
-def _get_bg_plane(fi, z_mm):
+def _rotate_plane(plane):
+    """把单极化背景场旋转为正交极化：Ex/Ey 互换，Hx/Hy 互换。"""
+    out = plane.copy()
+    out[..., [0, 1, 2, 3]] = plane[..., [2, 3, 0, 1]]
+    out[..., [6, 7, 8, 9]] = plane[..., [8, 9, 6, 7]]
+    return out
+
+def _get_bg_plane(fi, z_mm, pol=0):
     """从 blank 体数据插值得到目标 z 的背景场平面 (64,64,12)。"""
     global _BLANK_VOLUME
     if _BLANK_VOLUME is None:
@@ -105,7 +100,8 @@ def _get_bg_plane(fi, z_mm):
         _BLANK_VOLUME = np.load(BLANK_VOLUME_PATH)  # (9,43,64,64,12)
     f = interp1d(Z_MM_BLANK, _BLANK_VOLUME[fi].reshape(len(Z_MM_BLANK), -1),
                  axis=0, kind="linear", bounds_error=False, fill_value="extrapolate")
-    return f(z_mm).reshape(64, 64, 12).astype(np.float32)
+    plane = f(z_mm).reshape(64, 64, 12).astype(np.float32)
+    return _rotate_plane(plane) if int(pol) else plane
 
 
 def _load_gt_volume(sample_dir):
@@ -115,9 +111,15 @@ def _load_gt_volume(sample_dir):
     return np.load(path)  # (9,22,64,64,12)
 
 
-def _gt_plane_at_z(vol, fi, z_mm):
+def _gt_plane_at_z(vol, fi, z_mm, pol=0):
     """体数据在目标 z 的线性插值平面 (64,64,12)。"""
-    f = interp1d(Z_MM_VOL, vol[fi].reshape(len(Z_MM_VOL), -1),
+    if vol.ndim == 6:
+        if int(pol) >= vol.shape[0]:
+            raise ValueError(f"体数据只有 {vol.shape[0]} 个极化，请求 {pol}")
+        vol = vol[int(pol)]
+    n_z = vol.shape[1]
+    z_axis = np.arange(2, 2 + n_z, 1, dtype=float)
+    f = interp1d(z_axis, vol[fi].reshape(n_z, -1),
                  axis=0, kind="linear", bounds_error=False, fill_value="extrapolate")
     return f(z_mm).reshape(64, 64, 12).astype(np.float32)
 
@@ -126,46 +128,56 @@ def _rel_l2_complex(pred, gt, eps=1e-9):
     return float(np.linalg.norm(pred - gt) / (np.linalg.norm(gt) + eps))
 
 
-def predict_scatter_plane(ckpt_path, model_name, sample_dir, freq_ghz, d_lam):
-    """用 checkpoint 预测 0.1λ 截面的散射场，返回物理空间 (H,W,12)。"""
+def predict_scatter_plane(ckpt_path, sample_dir, freq_ghz, d_lam, pol=0, device="cpu"):
+    """用 checkpoint 预测 0.1λ 截面的散射场，返回物理空间 (H,W,12)。
+
+    模型类型由 checkpoint 自身记录的 `model_name` 决定（不再由命令行传、也不再
+    从一份会漏掉新模型的本地注册表里查）。缺 checkpoint 直接抛错——旧代码在这里
+    会用随机初始化的模型继续跑完并输出"预测结果"。
+    """
+    import models  # noqa: F401  触发自注册
+    from core.checkpoint import load as load_checkpoint
     from data.dataset import EMMultiFreqDataset
-    from data.norm_utils import OutputNormalizer
+
+    lc = load_checkpoint(ckpt_path, map_location=device)
+    model = lc.model.to(device).eval()
 
     ds = EMMultiFreqDataset(
         data_dir=DATA_DIR,
         output_field="all",
         normalize=False,
         target_d_over_lambda=d_lam,
-        use_scatter=True,
+        use_scatter=_use_scatter(),
         bg_params_path=BG_PARAMS_PATH,
     )
     norm_sample = os.path.abspath(sample_dir)
     idxs = [i for i, s in enumerate(ds.samples)
             if os.path.abspath(os.path.dirname(s["patch"])) == norm_sample
-            and s["freq_ghz"] == freq_ghz]
+            and s["freq_ghz"] == freq_ghz
+            and s.get("polarization", 0) == int(pol)]
     if not idxs:
         raise FileNotFoundError(
             f"未在 {DATA_DIR} 找到样本 {sample_dir} 的 {freq_ghz}GHz 记录")
     sample = ds[idxs[0]]
 
-    from eval_generalization import load_model
-    registry = _build_registry()
-    model_cls = registry.get(model_name)
-    if model_cls is None:
-        raise ValueError(f"未知模型: {model_name}，可选 {list(registry.keys())}")
-    model = load_model(model_cls, ckpt_path)
-    model.eval()
-
-    inp = sample["input"].unsqueeze(0)
-    freq = sample["freq"].unsqueeze(0)
+    inp = sample["input"].unsqueeze(0).to(device)
+    freq = sample["freq"].unsqueeze(0).to(device)
     with torch.no_grad():
         pred = model(inp, freq)
 
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    normalizer = OutputNormalizer.from_checkpoint(ckpt)
-    if normalizer is not None:
-        pred = normalizer.denormalize(pred)
-    return pred[0].permute(1, 2, 0).numpy().astype(np.float32)  # (H,W,12) 散射场
+    if lc.normalizer is not None:
+        pred = lc.normalizer.denormalize(pred)
+    print(f"[模型] {lc.model_name}  (epoch={lc.epoch}) → 预测截面 {freq_ghz}GHz")
+    return pred[0].permute(1, 2, 0).cpu().numpy().astype(np.float32)  # (H,W,12) 散射场
+
+
+def _use_scatter():
+    """是否用散射场。与 train.py 读同一个配置键，避免两处不一致。"""
+    try:
+        from configs import base as C
+        return bool(getattr(C, "USE_SCATTER_FIELD", False))
+    except ImportError:
+        return True
 
 
 def parse_targets(targets_str):
@@ -179,12 +191,15 @@ def main():
     ap.add_argument("--sample-dir", default=None, help="样本目录，如 data/data/circle/circle_1")
     ap.add_argument("--freq-ghz", type=float, required=True, help="频率 8~12 GHz")
     ap.add_argument("--ckpt", default=os.path.join(_ROOT, "checkpoints", "fno_attention", "best.pth"),
-                    help="FNO checkpoint 路径")
-    ap.add_argument("--model-name", default="fno_attention",
-                    help="模型类型（fno_attention/fno_baseline/fno_film/fno_lora/unet）")
+                    help="FNO checkpoint 路径（模型类型由其中的 model_name 决定）")
+    ap.add_argument("--model-name", default=None,
+                    help="已废弃：模型类型现由 checkpoint 自身的 model_name 决定。"
+                         "若指定且与 checkpoint 不符会报错。")
+    ap.add_argument("--device", default=None, help="cpu/cuda，默认自动判断")
     ap.add_argument("--from-plane", default=None,
                     help="直接使用预计算散射场平面 npy (H,W,12)，跳过模型")
     ap.add_argument("--d-lam", type=float, default=0.1, help="源截面归一化距离 d/λ")
+    ap.add_argument("--pol", type=int, default=0, choices=[0, 1], help="极化 0/1（默认 0）")
     ap.add_argument("--targets-mm", default=None,
                     help="目标 z 列表（mm，逗号分隔），默认 2~22 每隔 2mm")
     ap.add_argument("--cell-mm", type=float, default=CELL_MM, help="单元尺寸 mm")
@@ -196,9 +211,17 @@ def main():
     if args.from_plane:
         plane_src = np.load(args.from_plane).astype(np.float32)  # (H,W,12) 散射场
     elif args.sample_dir:
-        sample_dir = args.sample_dir
-        plane_src = predict_scatter_plane(args.ckpt, args.model_name,
-                                          sample_dir, args.freq_ghz, args.d_lam)
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if args.model_name:
+            import models  # noqa: F401
+            from core.checkpoint import read_meta
+            recorded = read_meta(args.ckpt)["model_name"]
+            if args.model_name != recorded:
+                ap.error(f"--model-name {args.model_name!r} 与 checkpoint 记录的不符 "
+                         f"（checkpoint 里是 {recorded!r}）。该参数已废弃，请直接省略。")
+            print("[提示] --model-name 已废弃：模型类型现由 checkpoint 自动决定。")
+        plane_src = predict_scatter_plane(args.ckpt, args.sample_dir, args.freq_ghz,
+                                          args.d_lam, args.pol, device)
     else:
         ap.error("--from-plane 与 --sample-dir 至少提供一个")
 
@@ -229,7 +252,7 @@ def main():
         E_t, H_t = propagate_em_twoway_from_source(E_src, H_src, dx=dx, dy=dx,
                                                    freq_hz=args.freq_ghz * 1e9, dz=dz)
         if not args.scatter_out:
-            bg = _get_bg_plane(fi, zt)
+            bg = _get_bg_plane(fi, zt, args.pol)
             bgE, bgH = _plane_to_em(bg)
             E_t = E_t + bgE
             H_t = H_t + bgH
@@ -238,7 +261,7 @@ def main():
 
         line = f"{zt:8.2f} "
         if gt is not None:
-            gt_plane = _gt_plane_at_z(gt, fi, zt)
+            gt_plane = _gt_plane_at_z(gt, fi, zt, args.pol)
             gtE, gtH = _plane_to_em(gt_plane)
             re = _rel_l2_complex(E_t, gtE)
             rh = _rel_l2_complex(H_t, gtH)

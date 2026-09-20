@@ -66,6 +66,63 @@ def field_geom_loss(
     }
 
 
+def _complex_total_amp(field, eps=1e-12):
+    """(B, 2M, H, W) 实虚成对 -> (B, M, H, W) 各分量幅值"""
+    B, C, H, W = field.shape
+    M = C // 2
+    return torch.sqrt(field[:, 0::2] ** 2 + field[:, 1::2] ** 2 + eps)
+
+
+def e_h_total_rel_l2(pred, true, eps=1e-6, h_boost=1.0):
+    """
+    E/H 分组【总场幅值】相对 L2，再平均（物理空间）。
+
+    核心动机：E 组 rms 与 H 组 rms 相差约 400 倍，直接合并算总场相对 L2
+    会让 H 场完全被淹没。改为 E、H 各自算总场相对 L2 再取平均，
+    迫使模型对 E 和 H 都达到比例精度 —— 对最终总场最有利。
+
+    h_boost>1 时提高 H 组（弱分量）权重：FNO 存在"傅里叶参数化偏差"，
+    天然偏置主导频率(强 E 场)，非主导的 H 场分量会被淹没（SpecB-FNO 依据），
+    额外加权 H 组可促使网络真正去拟合弱场结构。
+    """
+    def _total(field):
+        amp = _complex_total_amp(field, eps=eps)            # (B,M,H,W)
+        return torch.sqrt((amp ** 2).sum(dim=1) + eps)       # (B,H,W)
+    if pred.shape[1] >= 12:
+        e = 0.5 * (_rel_l2_2d(_total(pred[:, :6]), _total(true[:, :6]), eps)
+                   + h_boost * _rel_l2_2d(_total(pred[:, 6:12]), _total(true[:, 6:12]), eps))
+        return e
+    return _rel_l2_2d(_total(pred), _total(true), eps)
+
+
+def _rel_l2_2d(pred, true, eps=1e-6):
+    B = pred.shape[0]
+    d = (pred - true).reshape(B, -1).norm(dim=1)
+    n = true.reshape(B, -1).norm(dim=1).clamp(min=eps)
+    return (d / n).mean()
+
+
+def channel_group_balanced_l2(pred, true, eps=1e-6, h_boost=1.0):
+    """
+    逐通道相对 L2：E 组(6) 通道内取均值 + H 组(6) 通道内取均值，再平均。
+
+    物理空间逐通道相对误差是尺度不变的，天然平衡 Ex(200) / Ey(2300) / Ez(350)
+    与 H 组内各通道的差异；E、H 两组再取平均实现跨组平衡。
+
+    h_boost>1 时提高 H 组权重：H 组是非主导(弱)分量，易被 FNO 谱偏差淹没，
+    提权促使模型精细化拟合 H 组各通道。
+    """
+    def _ch_mean(field_p, field_t):
+        B, nch = field_p.shape[:2]
+        d = (field_p - field_t).reshape(B, nch, -1).norm(dim=2)
+        n = field_t.reshape(B, nch, -1).norm(dim=2).clamp(min=eps)
+        return (d / n).mean()
+    if pred.shape[1] >= 12:
+        return 0.5 * (_ch_mean(pred[:, :6], true[:, :6])
+                      + h_boost * _ch_mean(pred[:, 6:12], true[:, 6:12]))
+    return _ch_mean(pred, true)
+
+
 def lowfreq_fft_loss(pred, true, low_h=4, low_w=4):
     """频域低频结构相对误差：比较 rFFT 低频块（默认 4x4）的相对 L2。"""
     pred_ft = torch.fft.rfft2(pred.float(), norm="ortho")

@@ -1,65 +1,111 @@
 """
-电磁场多频点数据集
+电磁场多频点数据集（兼容单极化 / 双极化 v2 数据）
 
-数据结构（v2，当前唯一数据）：
+数据结构：
   data/data/<category>/<sample>/
     patch_plane.npy       (64, 64, 2)
-    field_volume_merged.npy  (9, 22, 64, 64, 12)
-      axis0: 9 个频点 [8.0~12.0 GHz]
-      axis1: 22 个 z 位置，2mm~23mm，步长 1mm
-      axis2/3: 64×64 空间
-      axis4: 12 通道 (Ex_r,Ex_i, Ey_r,Ey_i, Ez_r,Ez_i, Hx_r,Hx_i, Hy_r,Hy_i, Hz_r,Hz_i)
-      → 按归一化距离 d/λ 插值后取电场前 6 通道作为输出
+    field_volume_merged.npy
+      - 单极化: (9, N_Z, 64, 64, 12)
+      - 双极化: (2, 9, N_Z, 64, 64, 12)   [极化0, 极化1]
+    field_plane_d0.10.npy
+      - 单极化缓存: (9, 64, 64, 12)
+      - 双极化缓存: (2, 9, 64, 64, 12)
 
 输入：(2, H, W)  输出：(12, H, W) = Ex/Ey/Ez/Hx/Hy/Hz 各实部+虚部
-附加：freq (1,) 归一化频率 [0,1]
+附加：freq (2,) = [归一化频率, 极化索引]，其中极化作为模型条件与频率并列输入。
 """
 
 import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from collections import Counter
+from collections import Counter, defaultdict
 from scipy.interpolate import interp1d
 
 FREQ_LIST = [8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 12.0]
 FREQ_MIN, FREQ_MAX = FREQ_LIST[0], FREQ_LIST[-1]
 
-# v2 数据的 z 轴位置（mm），2mm~23mm，步长 1mm
-_Z_MM_V2 = np.arange(2, 24, 1, dtype=np.float32)  # shape (22,)
+# v2 数据的 z 轴位置（mm，相对贴片），2mm 起、步长 1mm；
+# 新双极化数据只导出 3 层时也用同一约定（2/3/4mm）。
+_Z_MM_START = 2.0
+_Z_MM_STEP = 1.0
 _C_LIGHT_MM = 3e11  # 光速 mm/s
+
 
 def _wavelength_mm(freq_ghz):
     return _C_LIGHT_MM / (freq_ghz * 1e9)
 
+
+def _z_mm_for_nz(n_z):
+    """根据当前体数据层数构造相对贴片的 z 轴，兼容旧 22 层和新 3 层。"""
+    return np.arange(_Z_MM_START, _Z_MM_START + n_z, _Z_MM_STEP, dtype=np.float32)
+
+
 def _interp_field_at_d_over_lambda(field_volume, freq_idx, target_d_lam, kind="linear"):
-    """从 v2 体数据中插值得到指定 d/λ 处的场平面，返回 (H, W, 12)。"""
+    """从单极化体数据 (9, N_Z, H, W, 12) 插值得到指定 d/λ 处的场平面。"""
     lam = _wavelength_mm(FREQ_LIST[freq_idx])
     field_freq = field_volume[freq_idx]  # (n_z, H, W, 12)
     n_z, H, W, C = field_freq.shape
-    
-    # 动态适应不同的切片数量 (起点2mm，步长1mm)
-    z_mm = np.arange(2, 2 + n_z, 1, dtype=np.float32)
+
+    z_mm = _z_mm_for_nz(n_z)
     z_norm = z_mm / lam  # (n_z,)
-    
+
     flat = field_freq.reshape(n_z, -1)
-    # n_z 较小时（如3层）cubic插值会报错，默认使用 linear
+    # n_z 较小时使用 linear，避免 cubic 插值在边界/短轴上抖动。
     interp_kind = kind if n_z >= 4 else "linear"
-    # 当目标距离超出范围时，通过 fill_value="extrapolate" 允许外推，以增强鲁棒性
-    f = interp_kind_func = interp1d(z_norm, flat, axis=0, kind=interp_kind, bounds_error=False, fill_value="extrapolate")
+    f = interp1d(z_norm, flat, axis=0, kind=interp_kind,
+                 bounds_error=False, fill_value="extrapolate")
     return f(target_d_lam).reshape(H, W, C).astype(np.float32)
+
+
+def _extract_output_channels(plane, output_field):
+    """把 (H, W, 12) 平面按配置切出训练输出。"""
+    ex_r, ex_i = plane[:, :, 0], plane[:, :, 1]
+    ey_r, ey_i = plane[:, :, 2], plane[:, :, 3]
+    ez_r, ez_i = plane[:, :, 4], plane[:, :, 5]
+    hx_r, hx_i = plane[:, :, 6], plane[:, :, 7]
+    hy_r, hy_i = plane[:, :, 8], plane[:, :, 9]
+    hz_r, hz_i = plane[:, :, 10], plane[:, :, 11]
+
+    if output_field == "all":
+        return np.stack([ex_r, ex_i, ey_r, ey_i, ez_r, ez_i,
+                         hx_r, hx_i, hy_r, hy_i, hz_r, hz_i], axis=0)
+    if output_field == "ex":
+        return np.stack([ex_r, ex_i], axis=0)
+    if output_field == "ey":
+        return np.stack([ey_r, ey_i], axis=0)
+    if output_field == "ez":
+        return np.stack([ez_r, ez_i], axis=0)
+    raise ValueError(f"不支持的 output_field: {output_field}")
+
 
 # 形状和类型到 index 的映射（扫描时动态建立）
 _SHAPE_INDEX = {}
 _TYPE_INDEX = {"normal": 0, "revert": 1}
+
 
 def get_shape_index(shape_name):
     if shape_name not in _SHAPE_INDEX:
         _SHAPE_INDEX[shape_name] = len(_SHAPE_INDEX)
     return _SHAPE_INDEX[shape_name]
 
+
 def get_type_index(type_name):
     return _TYPE_INDEX.get(type_name, 0)
+
+
+def _field_file_polarization_count(path):
+    """读取 npy header，返回可用极化数：
+    6D=(2,9,...) 或 5D 双极化缓存 (2,9,H,W,C) 返回 2，其余返回 1。"""
+    try:
+        arr = np.load(path, mmap_mode="r")
+        if arr.ndim == 6:
+            return int(arr.shape[0])
+        if arr.ndim == 5 and arr.shape[0] == 2 and arr.shape[1] == 9:
+            return 2
+    except Exception:
+        pass
+    return 1
 
 
 class EMMultiFreqDataset(Dataset):
@@ -76,13 +122,15 @@ class EMMultiFreqDataset(Dataset):
         smooth_sigma: float = 0.0,          # 已废弃，保留参数兼容旧调用
         use_scatter: bool = False,          # 是否减去背景场得到散射场
         bg_params_path: str = "data/blank/background_params.npz",
+        polarizations=None,                 # None = 使用每个文件实际可用的极化
     ):
         self.output_field = output_field.lower()
-        self.normalize    = normalize
+        self.normalize = normalize
         self.target_d_over_lambda = target_d_over_lambda
-        self.use_scatter  = use_scatter
+        self.use_scatter = use_scatter
         self.bg_params_path = bg_params_path
         self.output_normalizer = None
+        self.polarizations = self._normalize_polarizations(polarizations)
         if output_norm_mean is not None and output_norm_std is not None:
             from data.norm_utils import OutputNormalizer
             self.set_output_normalization(
@@ -108,7 +156,6 @@ class EMMultiFreqDataset(Dataset):
                     for e in it:
                         if not e.is_file() or not e.name.endswith("GHz.npy"):
                             continue
-                        # 兼容名字前缀，按最后一个 '_' 后的频率解析
                         try:
                             token = e.name.rsplit("_", 1)[-1]
                             f_ghz = float(token.replace("GHz.npy", ""))
@@ -120,85 +167,94 @@ class EMMultiFreqDataset(Dataset):
                 return {}
             return freq_map
 
+        def _append_polarization_records(base_record, field_path, fmt, n_pols):
+            if n_pols is None:
+                n_pols = _field_file_polarization_count(field_path)
+            selected = self._select_polarizations(n_pols)
+            for pol in selected:
+                record = dict(base_record)
+                record.update({
+                    "field": field_path,
+                    "polarization": pol,
+                    "n_polarizations": n_pols,
+                    "fmt": fmt,
+                })
+                self.samples.append(record)
+
         def _append_sample_records(sample_dir, category_name):
             patch_file = os.path.join(sample_dir, "patch_plane.npy")
             if not os.path.isfile(patch_file):
                 return
 
-            # v2 格式：优先读缓存的插值平面，没有则读体数据
             cache_file = os.path.join(sample_dir,
                 f"field_plane_d{self.target_d_over_lambda:.2f}.npy")
             volume_file = os.path.join(sample_dir, "field_volume_merged.npy")
 
+            base = {
+                "patch": patch_file,
+                "category": category_name,
+                "name": os.path.basename(sample_dir),
+            }
+
             if os.path.isfile(cache_file):
-                # 缓存文件：(9, 64, 64, 12)，直接按频点索引取
-                for fi, freq_ghz in enumerate(freq_targets):
+                # 缓存文件：(9, H, W, 12) 或 (2, 9, H, W, 12)
+                n_pols = _field_file_polarization_count(cache_file)
+                for freq_ghz in freq_targets:
                     if freq_ghz not in freq_targets_set:
                         continue
-                    self.samples.append({
-                        "patch":    patch_file,
-                        "field":    cache_file,
-                        "category": category_name,
-                        "name":     os.path.basename(sample_dir),
+                    row = dict(base)
+                    row.update({
                         "freq_ghz": freq_ghz,
                         "freq_idx": FREQ_LIST.index(freq_ghz),
-                        "fmt":      "v2_cache",
                     })
+                    _append_polarization_records(row, cache_file, "v2_cache", n_pols)
             elif os.path.isfile(volume_file):
-                for fi, freq_ghz in enumerate(freq_targets):
+                n_pols = _field_file_polarization_count(volume_file)
+                for freq_ghz in freq_targets:
                     if freq_ghz not in freq_targets_set:
                         continue
-                    self.samples.append({
-                        "patch":    patch_file,
-                        "field":    volume_file,
-                        "category": category_name,
-                        "name":     os.path.basename(sample_dir),
+                    row = dict(base)
+                    row.update({
                         "freq_ghz": freq_ghz,
                         "freq_idx": FREQ_LIST.index(freq_ghz),
-                        "fmt":      "v2",
                     })
+                    _append_polarization_records(row, volume_file, "v2", n_pols)
             else:
-                # v2 不存在，尝试 v1 格式：field_slice/*.npy
+                # v1 格式：field_slice/*.npy，只有单极化电场。
                 field_slice_dir = os.path.join(sample_dir, "field_slice")
                 freq_map = _build_freq_to_file(field_slice_dir)
                 for freq_ghz, field_file in freq_map.items():
-                    self.samples.append({
-                        "patch":    patch_file,
-                        "field":    field_file,
-                        "category": category_name,
-                        "name":     os.path.basename(sample_dir),
+                    row = dict(base)
+                    row.update({
+                        "field": field_file,
                         "freq_ghz": freq_ghz,
-                        "fmt":      "v1",
+                        "polarization": 0,
+                        "n_polarizations": 1,
+                        "fmt": "v1",
                     })
-                return
+                    self.samples.append(row)
 
         self.samples = []
         for cat_dir in sorted(_iter_dirs(data_dir)):
             cat_name = os.path.basename(cat_dir)
 
-            # 检测是否有子类别（两级 vs 三级目录）
-            # 如果子目录里没有 patch_plane.npy，说明是子类别目录
             sub_dirs = sorted(_iter_dirs(cat_dir))
 
-            # 判断是否为子类别层：取第一个子目录，看里面有没有 patch_plane.npy
             has_subcat = False
             if sub_dirs:
                 first_sub = sub_dirs[0]
                 first_sub_patch = os.path.join(first_sub, "patch_plane.npy")
                 first_sub_sub = _iter_dirs(first_sub)
-                # 如果第一个子目录里没有 patch_plane.npy 但有子目录，说明是子类别
                 if not os.path.exists(first_sub_patch) and first_sub_sub:
                     has_subcat = True
 
             if has_subcat:
-                # 三级：data_dir/category/subcategory/sample
                 for subcat_dir in sub_dirs:
                     subcat_name = os.path.basename(subcat_dir)
                     full_cat_name = f"{cat_name}/{subcat_name}"
                     for sample_dir in sorted(_iter_dirs(subcat_dir)):
                         _append_sample_records(sample_dir, full_cat_name)
             else:
-                # 两级：data_dir/category/sample（原有逻辑）
                 for sample_dir in sub_dirs:
                     _append_sample_records(sample_dir, cat_name)
 
@@ -207,18 +263,32 @@ class EMMultiFreqDataset(Dataset):
         if not self.samples:
             raise ValueError(f"未找到任何样本: {data_dir}")
 
-        cat_counts  = Counter(s["category"] for s in self.samples)
-        freq_counts = Counter(s["freq_ghz"]  for s in self.samples)
+        cat_counts = Counter(s["category"] for s in self.samples)
+        freq_counts = Counter(s["freq_ghz"] for s in self.samples)
+        pol_counts = Counter(s.get("polarization", 0) for s in self.samples)
         print(f"[EMMultiFreqDataset] {len(self.samples)} 条记录")
         print(f"  类别: {dict(sorted(cat_counts.items()))}")
         print(f"  频点: {sorted(freq_counts.keys())} GHz")
+        print(f"  极化记录: {dict(sorted(pol_counts.items()))}")
 
-        # 按 (category, name) 分组，用于频率插值训练
-        # shape_to_indices[(cat, name)] = [idx0, idx1, ...]  各频点的索引
-        from collections import defaultdict
+        # 按 (category, name, polarization) 分组，供频率插值训练使用。
         self.shape_to_indices = defaultdict(list)
         for i, s in enumerate(self.samples):
-            self.shape_to_indices[(s["category"], s["name"])].append(i)
+            key = (s["category"], s["name"], s.get("polarization", 0))
+            self.shape_to_indices[key].append(i)
+
+    @staticmethod
+    def _normalize_polarizations(polarizations):
+        if polarizations is None:
+            return None
+        if isinstance(polarizations, (int, np.integer)):
+            return [int(polarizations)]
+        return [int(p) for p in polarizations]
+
+    def _select_polarizations(self, n_pols):
+        if self.polarizations is None:
+            return list(range(n_pols))
+        return [p for p in self.polarizations if p < n_pols]
 
     def set_output_normalization(self, normalizer):
         """设置输出归一化器（data.norm_utils.OutputNormalizer）。"""
@@ -240,65 +310,55 @@ class EMMultiFreqDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
+        pol = int(s.get("polarization", 0))
 
         # 输入：SDF + Mask
         patch = np.load(s["patch"], mmap_mode="r").astype(np.float32)
-        sdf   = patch[:, :, 0] / (np.abs(patch[:, :, 0]).max() + 1e-8)
-        mask  = patch[:, :, 1]
+        sdf = patch[:, :, 0] / (np.abs(patch[:, :, 0]).max() + 1e-8)
+        mask = patch[:, :, 1]
         inp = torch.from_numpy(np.stack([sdf, mask], axis=0))
 
         # 输出：根据格式读取
         if s.get("fmt", "v1") == "v2_cache":
-            # 缓存格式：(9, 64, 64, 12)，直接按频点索引取
-            planes = np.load(s["field"], mmap_mode="r")           # (9, 64, 64, 12)
-            plane  = planes[s["freq_idx"]]         # (64, 64, 12)
-            ex_r, ex_i = plane[:, :, 0], plane[:, :, 1]
-            ey_r, ey_i = plane[:, :, 2], plane[:, :, 3]
-            ez_r, ez_i = plane[:, :, 4], plane[:, :, 5]
-            hx_r, hx_i = plane[:, :, 6], plane[:, :, 7]
-            hy_r, hy_i = plane[:, :, 8], plane[:, :, 9]
-            hz_r, hz_i = plane[:, :, 10], plane[:, :, 11]
-            if self.output_field == "all":
-                out = np.stack([ex_r, ex_i, ey_r, ey_i, ez_r, ez_i,
-                                hx_r, hx_i, hy_r, hy_i, hz_r, hz_i], axis=0)
-            elif self.output_field == "ez":
-                out = np.stack([ez_r, ez_i], axis=0)
-            elif self.output_field == "ex":
-                out = np.stack([ex_r, ex_i], axis=0)
-            elif self.output_field == "ey":
-                out = np.stack([ey_r, ey_i], axis=0)
+            planes = np.load(s["field"], mmap_mode="r")
+            if planes.ndim == 6:
+                plane = planes[pol, s["freq_idx"], :, :, :]
+            elif planes.ndim == 5 and planes.shape[0] == 2 and planes.shape[1] == 9:
+                # 双极化缓存 (2,9,H,W,C)
+                plane = planes[pol, s["freq_idx"], :, :, :]
             else:
-                raise ValueError(f"不支持的 output_field: {self.output_field}")
+                plane = planes[s["freq_idx"]]
+            out = _extract_output_channels(plane, self.output_field)
+
         elif s.get("fmt", "v1") == "v2":
-            field_volume = np.load(s["field"], mmap_mode="r")  # 可能为 (9, 22, H, W, 12) 或 (2, 9, 3, H, W, 12)
-            
-            # 如果是 6D 双极化格式，目前默认取极化 0 的数据
-            if field_volume.ndim == 6 and field_volume.shape[0] == 2:
-                field_volume = field_volume[0]
-                
+            field_volume = np.load(s["field"], mmap_mode="r")
+            if field_volume.ndim == 6:
+                if pol >= field_volume.shape[0]:
+                    raise ValueError(
+                        f"{s['field']} 只有 {field_volume.shape[0]} 个极化，"
+                        f"请求极化 {pol}"
+                    )
+                field_volume = field_volume[pol]
+            elif pol != 0:
+                raise ValueError(
+                    f"{s['field']} 是单极化文件，不能请求极化 {pol}"
+                )
+
             def _extract_all_channels(d_lam):
                 plane = _interp_field_at_d_over_lambda(
                     field_volume, s["freq_idx"], d_lam
-                )  # (H, W, 12)
-                ex_r, ex_i = plane[:, :, 0], plane[:, :, 1]
-                ey_r, ey_i = plane[:, :, 2], plane[:, :, 3]
-                ez_r, ez_i = plane[:, :, 4], plane[:, :, 5]
-                hx_r, hx_i = plane[:, :, 6], plane[:, :, 7]
-                hy_r, hy_i = plane[:, :, 8], plane[:, :, 9]
-                hz_r, hz_i = plane[:, :, 10], plane[:, :, 11]
-                return np.stack([ex_r, ex_i, ey_r, ey_i, ez_r, ez_i,
-                                 hx_r, hx_i, hy_r, hy_i, hz_r, hz_i], axis=0)
+                )
+                return _extract_output_channels(plane, "all")
 
-            # 获取中心平面的全部 12 通道
             out = _extract_all_channels(self.target_d_over_lambda)
-            
-            # 获取 z-1mm 和 z+1mm 的场，用于 PINN 中心差分
+
+            # 获取 z-1mm 和 z+1mm 的场，用于 PINN 中心差分（v2 体数据路径）。
             lam_mm = _wavelength_mm(s["freq_ghz"])
-            delta_d_lam = 1.0 / lam_mm  # 1mm 的波长偏移
+            delta_d_lam = 1.0 / lam_mm
             out_zminus = _extract_all_channels(self.target_d_over_lambda - delta_d_lam)
-            out_zplus  = _extract_all_channels(self.target_d_over_lambda + delta_d_lam)
-            
-            # 兼容以前的单场截取
+            out_zplus = _extract_all_channels(self.target_d_over_lambda + delta_d_lam)
+
+            # 兼容旧 output_field 配置。
             if self.output_field == "ez":
                 out = out[4:6]
             elif self.output_field == "ex":
@@ -324,14 +384,15 @@ class EMMultiFreqDataset(Dataset):
             else:
                 raise ValueError(f"不支持的 output_field: {self.output_field}")
 
-        # 散射场：减去拟合的理想背景场（仅 v2 格式支持）
+        # 散射场：减去拟合的理想背景场（仅 v2 格式支持）。
         if self.use_scatter and s.get("fmt", "v1").startswith("v2"):
             from data.fit_background import get_background_field
             from data.interpolate_field import get_wavelength_mm
             freq_ghz = s["freq_ghz"]
             z_mm = self.target_d_over_lambda * get_wavelength_mm(freq_ghz)
-            bg = get_background_field(freq_ghz, z_mm, self.bg_params_path)  # (12,)
-            # out shape: (n_ch, H, W)，bg shape: (12,)，只减对应通道
+            bg = get_background_field(
+                freq_ghz, z_mm, self.bg_params_path, polarization=pol
+            )  # (12,)
             n_ch = out.shape[0]
             bg_broadcast = bg[:n_ch, None, None]  # (n_ch, 1, 1)
             out = out - bg_broadcast
@@ -343,25 +404,27 @@ class EMMultiFreqDataset(Dataset):
             out = self.output_normalizer.normalize_np(out, ch_slice=sl)
 
         freq_norm = (s["freq_ghz"] - FREQ_MIN) / (FREQ_MAX - FREQ_MIN)
-        
+        pol_norm = float(pol)
+
         # 解析形状和类型
         category_parts = s["category"].split("/")
-        shape_name = category_parts[0]  # circle, cross_base, ...
-        type_name = category_parts[1] if len(category_parts) > 1 else "normal"  # normal, revert
+        shape_name = category_parts[0]
+        type_name = category_parts[1] if len(category_parts) > 1 else "normal"
 
         res = {
-            "input":     inp,
-            "output":    torch.from_numpy(out),
-            "name":      s["name"],
-            "category":  s["category"],
-            "freq_ghz":  torch.tensor(s["freq_ghz"], dtype=torch.float32),
-            "freq":      torch.tensor([freq_norm], dtype=torch.float32),
+            "input": inp,
+            "output": torch.from_numpy(out),
+            "name": s["name"],
+            "category": s["category"],
+            "freq_ghz": torch.tensor(s["freq_ghz"], dtype=torch.float32),
+            "freq": torch.tensor([freq_norm, pol_norm], dtype=torch.float32),
+            "pol_idx": torch.tensor([pol], dtype=torch.long),
             "shape_idx": torch.tensor([get_shape_index(shape_name)], dtype=torch.long),
-            "type_idx":  torch.tensor([get_type_index(type_name)], dtype=torch.long),
+            "type_idx": torch.tensor([get_type_index(type_name)], dtype=torch.long),
         }
-        
-        if 'out_zminus' in locals() and 'out_zplus' in locals():
+
+        if "out_zminus" in locals() and "out_zplus" in locals():
             res["out_zminus"] = torch.from_numpy(out_zminus)
-            res["out_zplus"]  = torch.from_numpy(out_zplus)
-            
+            res["out_zplus"] = torch.from_numpy(out_zplus)
+
         return res

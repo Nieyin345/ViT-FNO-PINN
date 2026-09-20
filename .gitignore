@@ -9,6 +9,11 @@ data/blank/
 # 模型权重（含子目录）
 checkpoints/*.pth
 checkpoints/**/*.pth
+# checkpoints/ 目录被 git 视为未跟踪目录，加这条让 .pth 规则真正生效
+checkpoints/
+# 训练产物（归一化统计量、summary），与权重同源，不入库
+checkpoints/**/*.json
+checkpoints/**/*.npz
 
 # HFSS 场文件（单文件几十 MB）
 *.fld
@@ -35,6 +40,16 @@ __pycache__/
 cloudflared
 vscode_cli*
 *.log
+.tmp/
+.scholar_tmp/
+
+# 可编辑安装产物
+*.egg-info/
+build/
+dist/
+
+# 对比实验输出
+runs/
 
 # 系统文件
 .DS_Store

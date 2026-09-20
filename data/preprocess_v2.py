@@ -2,6 +2,10 @@
 预处理 v2 数据：把体数据在指定 d/λ 处插值，缓存为小文件。
 运行一次后训练速度大幅提升。
 
+缓存格式保持与源数据一致：
+  - 单极化: (9, 64, 64, 12)
+  - 双极化: (2, 9, 64, 64, 12)
+
 用法：python data/preprocess_v2.py
 """
 
@@ -12,7 +16,7 @@ from interpolate_field import extract_plane_at_normalized_distance, FREQ_LIST
 
 DATA_DIR = "data/data"
 TARGET_D_OVER_LAMBDA = 0.1
-CACHE_SUFFIX = f"_plane_d{TARGET_D_OVER_LAMBDA:.2f}.npy"  # e.g. _plane_d0.10.npy
+CACHE_SUFFIX = f"_plane_d{TARGET_D_OVER_LAMBDA:.2f}.npy"
 
 
 def preprocess_all(data_dir=DATA_DIR, target_d=TARGET_D_OVER_LAMBDA):
@@ -21,6 +25,7 @@ def preprocess_all(data_dir=DATA_DIR, target_d=TARGET_D_OVER_LAMBDA):
 
     total = 0
     skipped = 0
+    shape_counts = {}
 
     for cat in sorted(categories):
         cat_dir = os.path.join(data_dir, cat)
@@ -30,7 +35,7 @@ def preprocess_all(data_dir=DATA_DIR, target_d=TARGET_D_OVER_LAMBDA):
         for sample in tqdm(samples, desc=cat):
             sample_dir = os.path.join(cat_dir, sample)
             volume_file = os.path.join(sample_dir, "field_volume_merged.npy")
-            cache_file  = os.path.join(sample_dir, f"field_plane_d{target_d:.2f}.npy")
+            cache_file = os.path.join(sample_dir, f"field_plane_d{target_d:.2f}.npy")
 
             if not os.path.isfile(volume_file):
                 continue
@@ -39,16 +44,20 @@ def preprocess_all(data_dir=DATA_DIR, target_d=TARGET_D_OVER_LAMBDA):
                 skipped += 1
                 continue
 
-            # 加载体数据并插值
-            field_volume = np.load(volume_file)  # (9, 22, 64, 64, 12)
+            field_volume = np.load(volume_file, mmap_mode="r")
+            # 3 层短 z 轴使用 linear；旧 22 层仍用 cubic。
+            n_z = field_volume.shape[2] if field_volume.ndim == 6 else field_volume.shape[1]
+            kind = "cubic" if n_z >= 4 else "linear"
             planes = extract_plane_at_normalized_distance(
-                field_volume, target_d, kind="cubic"
-            )  # (9, 64, 64, 12)
+                field_volume, target_d, kind=kind
+            )
 
             np.save(cache_file, planes)
             total += 1
+            shape_counts[planes.shape] = shape_counts.get(planes.shape, 0) + 1
 
     print(f"\n完成：新生成 {total} 个，跳过已有 {skipped} 个")
+    print(f"缓存维度统计: {shape_counts}")
     print(f"缓存文件名格式：field_plane_d{target_d:.2f}.npy")
 
 

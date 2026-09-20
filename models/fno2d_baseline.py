@@ -1,20 +1,23 @@
-"""
-纯 FNO2d 基线模型（对比实验用）
+"""纯 FNO2d 基线模型（对比实验用）。
 
-与 fno2d.py 的区别：
+与 models/fno2d.py 的区别：
 - 无超网络、无条件注意力机制
-- 频率信息展开成 2D 常数通道，和 SDF/Mask 一起作为输入
+- 条件信息展开成常数通道，和 SDF/Mask 一起作为输入（"空间通道广播"式条件化）
 - 标准 FNO 频域卷积（无注意力）
-- 输入通道：SDF + Mask + freq_channel = 3 通道
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .fno_core import FNOBase
+
+from core.base import FNOBase
+from core.config import ModelConfig
+from core.registry import register
+
 
 class SpectralConv2dVanilla(nn.Module):
     """标准 FNO 频域卷积，无任何条件机制。"""
+
     def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
         super().__init__()
         self.in_channels = in_channels
@@ -42,52 +45,59 @@ class SpectralConv2dVanilla(nn.Module):
 
 class FNOBlockVanilla(nn.Module):
     """标准 FNO block：频域卷积 + bypass Conv1×1 + BN + GELU。"""
+
     def __init__(self, width: int, modes1: int, modes2: int):
         super().__init__()
         self.spectral = SpectralConv2dVanilla(width, width, modes1, modes2)
         self.bypass = nn.Conv2d(width, width, kernel_size=1)
         self.norm = nn.BatchNorm2d(width)
 
-    def forward(self, x, freq_emb=None, geom_emb=None):
+    def forward(self, x, cond=None):
         return F.gelu(self.norm(self.spectral(x) + self.bypass(x)))
 
 
+@register("fno_baseline")
 class FNO2dBaseline(FNOBase):
+    """纯 FNO2d 基线。
+
+    输入处理：freq (B,K) 条件向量 → 展开成 (B,K,H,W)，与 SDF/Mask (B,2,H,W) 拼接。
     """
-    纯 FNO2d 基线。
-    输入处理：
-        freq (B,1) 标量 → 展开成 (B,1,H,W) 常数通道
-        与 SDF/Mask (B,2,H,W) 拼接 → (B,3,H,W) 作为网络输入
-    """
-    def __init__(
-        self,
-        modes1: int = 12,
-        modes2: int = 12,
-        width: int = 48,
-        n_layers: int = 5,
-        out_channels: int = 6,
-    ):
-        super().__init__(in_channels=3, width=width, padding=7)
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__(cfg)
+        self.in_channels = cfg.in_channels
+        self.cond_channels = int(cfg.cond_channels)
+        # lift 实际接收 in_channels + cond_channels（基座按 cfg.in_channels 建的，这里重建）
+        self.lift = nn.Sequential(
+            nn.Conv2d(self.in_channels + self.cond_channels, cfg.width, kernel_size=1),
+            nn.GELU(),
+        )
 
         self.blocks = nn.ModuleList([
-            FNOBlockVanilla(width, modes1, modes2) for _ in range(n_layers)
+            FNOBlockVanilla(cfg.width, cfg.modes1, cfg.modes2) for _ in range(cfg.n_layers)
         ])
 
         self.proj = nn.Sequential(
-            nn.Conv2d(width, 64, kernel_size=1),
+            nn.Conv2d(cfg.width, 64, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(64, out_channels, kernel_size=1),
+            nn.Conv2d(64, cfg.out_channels, kernel_size=1),
         )
 
-    def preprocess_input(self, x: torch.Tensor, freq: torch.Tensor):
-        B, C, H, W = x.shape
-        if freq is not None:
-            freq_map = freq.view(B, 1, 1, 1).expand(B, 1, H, W)
-        else:
-            freq_map = torch.zeros(B, 1, H, W, device=x.device, dtype=x.dtype)
-        x = torch.cat([x, freq_map], dim=1)
-        return x, None, None
+    def _broadcast_condition(self, x, freq):
+        B, _, H, W = x.shape
+        if freq is None:
+            return torch.zeros(B, self.cond_channels, H, W, device=x.device, dtype=x.dtype)
+        if freq.dim() == 1:
+            freq = freq.unsqueeze(1)
+        n_cond = freq.shape[1]
+        if n_cond < self.cond_channels:
+            pad = torch.zeros(B, self.cond_channels - n_cond, device=x.device, dtype=x.dtype)
+            freq = torch.cat([freq, pad], dim=1)
+        cond = freq[:, :self.cond_channels]
+        return cond.view(B, self.cond_channels, 1, 1).expand(B, self.cond_channels, H, W)
+
+    def build_input(self, x, freq):
+        return torch.cat([x, self._broadcast_condition(x, freq)], dim=1)
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(x)
-

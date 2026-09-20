@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patch2field"
+version = "0.2.0"
+description = "FNO 预测电磁超表面单元近场切面分布，并用角谱法级联传播到全空间"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "scipy",
+    "matplotlib",
+]
+
+# 说明：本仓库**不打包**，只做可编辑安装（pip install -e .），
+# 目的是让 configs / core / models / data / tools / field2field 六个顶层包
+# 在任何工作目录下都能 import，而不必手动设 sys.path 或 PYTHONPATH。
+[tool.setuptools]
+packages = ["configs", "core", "models", "data", "tools", "field2field"]

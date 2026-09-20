@@ -8,8 +8,9 @@
 import os
 import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)                          # patch2field/ 自身
-sys.path.insert(0, os.path.join(_HERE, ".."))      # 根目录（data/ 等）
+_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, _ROOT)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import threading
@@ -27,39 +28,31 @@ from collections import defaultdict
 from torch.utils.data import Subset, ConcatDataset, DataLoader
 from scipy.ndimage import distance_transform_edt
 
-import config as C
+import models  # noqa: F401  触发所有模型自注册
+from core.checkpoint import load as load_checkpoint
+from core.registry import build_model, available as available_models
+from configs import base as C
 from data.dataset import EMMultiFreqDataset
 from data.norm_utils import OutputNormalizer
-from models.fno2d import FNO2d
-from models.fno2d_baseline import FNO2dBaseline
-from models.fno2d_film import FNO2dFiLM
-from models.unet2d import UNet2d
-from models.fno2d_lora import FNO2dLoRA
 from models.losses import field_geom_loss
 
-_MODEL_REGISTRY = {
-    "fno_attention": FNO2d,
-    "fno_baseline":  FNO2dBaseline,
-    "fno_film":      FNO2dFiLM,
-    "unet":          UNet2d,
-    "fno_lora":      FNO2dLoRA,
-}
 
 def _build_model():
-    """根据 experiment_config 的 ACTIVE_EXPERIMENT 构建对应模型。"""
-    model_name = getattr(C, "MODEL_NAME", "fno_attention")
-    n_ch = getattr(C, "OUT_CHANNELS", 6)
-    cls = _MODEL_REGISTRY.get(model_name, FNO2d)
-    if cls is FNO2d:
-        return cls(modes1=C.MODES1, modes2=C.MODES2, width=C.WIDTH,
-                   n_layers=C.N_LAYERS, in_channels=2, out_channels=n_ch,
-                   freq_dim=C.FREQ_DIM)
-    if model_name == "fno_lora":
-        return cls(modes1=C.MODES1, modes2=C.MODES2, width=C.WIDTH,
-                   n_layers=C.N_LAYERS, out_channels=n_ch,
-                   lora_rank=getattr(C, "LORA_RANK", 4))
-    return cls(modes1=C.MODES1, modes2=C.MODES2, width=C.WIDTH,
-               n_layers=C.N_LAYERS, out_channels=n_ch)
+    """按 configs 里当前实验的模型名与结构参数构建模型。
+
+    旧实现维护了一份本地 `_MODEL_REGISTRY`（5 个模型，缺 fno_v2），且未知名字用
+    `_MODEL_REGISTRY.get(model_name, FNO2d)` **静默退回 FNO2d**，随后又用
+    `strict=False` 把权重塞进去——于是一个名字写错的运行能一路跑到出图。
+    现在走全仓库唯一注册表，未知名字直接抛错并列出可选值。
+
+    注意：GUI 加载 checkpoint 时**以 checkpoint 为准**（见
+    `_load_checkpoint_from_file`），本函数只在没有 checkpoint 时用于取随机模型。
+    """
+    name = C.model_name_from_globals()
+    cfg = C.model_config_from_globals()
+    model = build_model(name, cfg)
+    print(f"[模型] {name}  参数量: {sum(p.numel() for p in model.parameters()):,}")
+    return model
 
 # 设置matplotlib样式
 plt.style.use('default')
@@ -152,6 +145,7 @@ class EvalApp:
         self.setup_styles()
         
         self._model = None
+        self._ckpt_meta = {}
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._train_ds = None
         self._val_ds = None
@@ -534,8 +528,9 @@ class EvalApp:
             # 【修复点】：模型训练时，频率是被归一化到 [0, 1] 区间的！
             # 计算公示见 dataset.py: (freq - FREQ_MIN) / (FREQ_MAX - FREQ_MIN)
             freq_val = self.draw_freq_var.get()
-            freq_norm = (freq_val - 8.0) / (12.0 - 8.0) 
-            freq = torch.tensor([freq_norm], dtype=torch.float32).to(self._device)
+            freq_norm = (freq_val - 8.0) / (12.0 - 8.0)
+            # 手绘区默认用极化 0；数据评估会使用 dataset 中每条的极化条件。
+            freq = torch.tensor([freq_norm, 0.0], dtype=torch.float32).to(self._device)
             
             # 因为之前撤销了类别Embedding控制，我们现在直接全靠超网络的 QK 处理形状和频率！
             
@@ -626,23 +621,46 @@ class EvalApp:
             return
 
         cfg = lambda k, d='N/A': getattr(C, k, d)
-            
+
+        # 模型信息以实际加载的模型为准（checkpoint 决定架构，config 只是回退）
+        model = getattr(self, '_model', None)
+        if model is not None:
+            arch_name = (getattr(self, '_ckpt_meta', {}) or {}).get("model_name") \
+                        or getattr(model, "model_name", "N/A")
+            arch_cls = type(model).__name__
+            n_params = sum(p.numel() for p in model.parameters())
+            model_cfg = C.model_config_from_globals()
+            arch_detail = (
+                f"    - 注册名: {arch_name} (类 {arch_cls})\n"
+                f"    - 参数量: {n_params:,}\n"
+                f"    - 模式数 (modes): {model_cfg.modes1} x {model_cfg.modes2}\n"
+                f"    - 宽度 (width): {model_cfg.width}\n"
+                f"    - 层数 (n_layers): {model_cfg.n_layers}\n"
+                f"    - 输出头 (head): {model_cfg.head}\n"
+                f"    - 条件化 (kernel_cond): {model_cfg.kernel_cond}"
+                + (f" (rank={model_cfg.lora_rank})" if model_cfg.kernel_cond == "lora" else "")
+            )
+            io_detail = (
+                f"  - 输入通道: {model_cfg.in_channels} (SDF + 掩码)\n"
+                f"  - 输出通道: {model_cfg.out_channels} "
+                f"({'Ex/Ey/Ez/Hx/Hy/Hz 各实虚部' if model_cfg.out_channels >= 12 else '部分分量'})\n"
+                f"    - 频率编码维度: {model_cfg.freq_dim}"
+            )
+        else:
+            arch_name, arch_detail = "未加载", "    - 尚未加载模型"
+            io_detail = "  - 尚未加载模型"
+
         self.stats_text.configure(state=tk.NORMAL)
         self.stats_text.delete(1.0, tk.END)
-        
+
         stats_info = f"""
 📊 模型配置信息
 {'='*50}
 
 🏗️ 模型架构:
-  - 模型类型: FNO2d (Fourier Neural Operator 2D)
-    - 模式数 (modes1): {cfg('MODES1')}
-    - 模式数 (modes2): {cfg('MODES2')}
-    - 宽度 (width): {cfg('WIDTH')}
-    - 层数 (n_layers): {cfg('N_LAYERS')}
-  - 输入通道: 2 (SDF + 掩码)
-  - 输出通道: 6 (Ex_r, Ex_i, Ey_r, Ey_i, Ez_r, Ez_i)
-    - 频率编码维度: {cfg('FREQ_DIM')}
+  - 模型类型: {arch_name}
+{arch_detail}
+{io_detail}
 
 ⚙️ 训练配置:
     - 批大小 (batch_size): {cfg('BATCH_SIZE')}
@@ -802,59 +820,59 @@ class EvalApp:
             return self._val_ds, mode
         return ConcatDataset([self._train_ds, self._val_ds]), mode
 
-    def _extract_state_dict(self, ckpt):
-        """从不同格式检查点中提取 state_dict。"""
-        if isinstance(ckpt, dict):
-            for k in ["model_state_dict", "state_dict", "model", "net"]:
-                v = ckpt.get(k)
-                if isinstance(v, dict):
-                    return v
-            if ckpt and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
-                return ckpt
-        return None
-
     def _load_checkpoint_robust(self, ckpt_path):
-        """鲁棒加载：仅加载名称与形状都匹配的权重，避免模型变更导致崩溃。"""
-        meta = {"epoch": "N/A", "val_loss": "N/A", "val_rel": "N/A", "loaded": 0, "skipped": 0}
+        """按 checkpoint 自身记录的架构重建模型并严格加载权重。
+
+        旧实现是"先把当前 config 构一个模型，再把 checkpoint 里名称与形状都匹配
+        的权重塞进去，`strict=False`"，然后只报告"匹配 N 层，跳过 M 层"。这意味着
+        模型选错 / 结构参数不对时，GUI 会拿一个**部分随机初始化**的模型画图，
+        而界面上看不出任何异常。
+
+        现在：`core.checkpoint.load` 按 checkpoint 里的 `model_config` 重建，
+        `strict=True`，不匹配直接抛错。副作用（有意）：默认未指定 checkpoint
+        时，GUI 会用当前 config 构建一个随机初始化模型并明确提示，便于先看数据
+        和界面；但**一旦指定了 checkpoint，模型类型与结构就完全由它决定**，
+        与界面上的 config 无关。
+        """
+        meta = {"epoch": "N/A", "val_loss": "N/A", "val_rel": "N/A",
+                "val_geom": "N/A", "model_name": "N/A", "params": 0,
+                "loaded": 0, "skipped": 0}
         self._output_normalizer = None
 
-        if not os.path.exists(ckpt_path):
+        if not ckpt_path or not os.path.exists(ckpt_path):
             self.update_status(f"未找到检查点，使用随机初始化模型: {ckpt_path}")
+            meta["model_name"] = C.model_name_from_globals()
+            meta["params"] = sum(p.numel() for p in self._model.parameters())
             return meta
 
-        ckpt = torch.load(ckpt_path, map_location=self._device, weights_only=False)
-        if isinstance(ckpt, dict):
-            meta["epoch"] = ckpt.get("epoch", "N/A")
-            meta["val_loss"] = ckpt.get("val_loss", "N/A")
-            meta["val_rel"] = ckpt.get("val_rel", "N/A")
-            self._output_normalizer = OutputNormalizer.from_checkpoint(ckpt)
-            if self._output_normalizer is not None:
-                self.update_status(
-                    f"检测到输出标准化统计量（模式={self._output_normalizer.mode}），"
-                    "预测结果将自动反标准化"
-                )
+        try:
+            lc = load_checkpoint(ckpt_path, map_location=str(self._device), quiet=True)
+        except (KeyError, ValueError, RuntimeError, FileNotFoundError) as e:
+            # 不做静默降级：把失败原因完整抛给用户
+            self.update_status(f"检查点加载失败: {type(e).__name__}: {e}", True)
+            raise
 
-        state_dict = self._extract_state_dict(ckpt)
-        if state_dict is None:
-            self.update_status("检查点中未找到可识别的 state_dict，使用随机初始化模型", True)
-            return meta
+        self._model = lc.model.to(self._device)
+        self._output_normalizer = lc.normalizer
 
-        normalized = {}
-        for k, v in state_dict.items():
-            nk = k[7:] if k.startswith("module.") else k
-            normalized[nk] = v
+        meta["epoch"] = lc.epoch if lc.epoch is not None else "N/A"
+        meta["val_loss"] = lc.meta.get("val_loss", "N/A")
+        meta["val_rel"] = lc.meta.get("val_rel", "N/A")
+        meta["val_geom"] = lc.meta.get("val_geom", "N/A")
+        meta["model_name"] = lc.model_name
+        meta["params"] = sum(p.numel() for p in self._model.parameters())
+        meta["loaded"] = len(lc.model.state_dict())
+        meta["skipped"] = 0
 
-        model_sd = self._model.state_dict()
-        compatible = {
-            k: v for k, v in normalized.items()
-            if k in model_sd and isinstance(v, torch.Tensor) and model_sd[k].shape == v.shape
-        }
-        model_sd.update(compatible)
-        self._model.load_state_dict(model_sd, strict=False)
-
-        meta["loaded"] = len(compatible)
-        meta["skipped"] = len(normalized) - len(compatible)
-        self.update_status(f"权重加载完成: 匹配 {meta['loaded']} 层，跳过 {meta['skipped']} 层")
+        self.update_status(
+            f"权重加载完成: {lc.model_name}  参数量 {meta['params']:,}  "
+            f"epoch={meta['epoch']}  val_geom={meta['val_geom']}"
+        )
+        if self._output_normalizer is not None:
+            self.update_status(
+                f"检测到输出标准化统计量（模式={self._output_normalizer.mode}），"
+                "预测结果将自动反标准化"
+            )
         return meta
 
     def _safe_model_forward(self, inp, freq=None, shape_idx=None, type_idx=None):
@@ -948,6 +966,7 @@ class EvalApp:
                     bg_params_path=os.path.abspath(os.path.join(
                         _HERE, getattr(C, "BACKGROUND_PARAMS_PATH", "../data/blank/background_params.npz")
                     )),
+                    polarizations=getattr(C, "DATASET_POLARIZATIONS", None),
                 )
                 
                 # 过滤选中的类别（兼容两级和三级目录结构）
@@ -973,6 +992,7 @@ class EvalApp:
                 self._model = _build_model().to(self._device)
 
                 ckpt_meta = self._load_checkpoint_robust(self.ckpt_var.get())
+                self._ckpt_meta = ckpt_meta
                 self._model.eval()
                 self.update_progress(100)
 
@@ -1022,9 +1042,11 @@ class EvalApp:
 训练集: {len(self._train_ds)} 样本
 验证集: {len(self._val_ds)} 样本
 评估数据集: {eval_mode}
+模型: {ckpt_meta['model_name']}  参数量: {ckpt_meta['params']:,}
 训练轮次: {ckpt_meta['epoch']}
 验证损失(val_loss): {ckpt_meta['val_loss']}
 验证误差(val_rel): {ckpt_meta['val_rel']}
+验证Geom(val_geom): {ckpt_meta['val_geom']}
 快速RelErr(前{quick_batches}批): {quick_rel:.4f}
 设备: {self._device}"""
 

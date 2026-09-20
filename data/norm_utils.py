@@ -131,24 +131,46 @@ class OutputNormalizer:
         return d
 
     @classmethod
-    def from_checkpoint(cls, ckpt, eps=1e-8):
-        """从 checkpoint dict 恢复归一化器；旧 checkpoint 无 output_norm_mode 时按 zscore 解释。"""
-        if not isinstance(ckpt, dict):
+    def from_dict(cls, d, eps=1e-8):
+        """从 `to_dict()` 产出的扁平 dict 恢复归一化器。
+
+        无 output_norm_mode 时按 zscore 解释（旧 checkpoint / npz 统计文件）。
+        参数缺失时返回 None（而不是抛错），调用方据此判定"无归一化"。
+        """
+        if not isinstance(d, dict):
             return None
-        mode = ckpt.get("output_norm_mode", "zscore")
+        mode = d.get("output_norm_mode", "zscore")
+        if mode == "none":
+            return cls(mode="none", eps=eps)
         if mode == "log":
             keys = ("output_norm_scale", "output_norm_logmean", "output_norm_logstd")
-            if all(k in ckpt for k in keys):
+            if all(k in d for k in keys):
                 return cls(mode="log",
-                           scale=ckpt["output_norm_scale"],
-                           logmean=ckpt["output_norm_logmean"],
-                           logstd=ckpt["output_norm_logstd"],
+                           scale=d["output_norm_scale"],
+                           logmean=d["output_norm_logmean"],
+                           logstd=d["output_norm_logstd"],
                            eps=eps)
             return None
-        if "output_norm_mean" in ckpt and "output_norm_std" in ckpt:
-            return cls(mode="zscore",
-                       mean=ckpt["output_norm_mean"],
-                       std=ckpt["output_norm_std"],
-                       eps=eps)
-        return None
+        if mode == "zscore":
+            if "output_norm_mean" in d and "output_norm_std" in d:
+                return cls(mode="zscore",
+                           mean=d["output_norm_mean"],
+                           std=d["output_norm_std"],
+                           eps=eps)
+            return None
+        raise ValueError(f"不支持的归一化模式: {mode}，可选 {MODES}")
+
+    @classmethod
+    def from_checkpoint(cls, ckpt, eps=1e-8):
+        """从 checkpoint dict 恢复归一化器。
+
+        新格式把扁平 dict 放在 `ckpt["normalizer"]` 下；旧格式直接平铺在顶层，
+        这里一并兼容（旧 checkpoint 无 output_norm_mode 时按 zscore 解释）。
+        """
+        if not isinstance(ckpt, dict):
+            return None
+        nested = ckpt.get("normalizer")
+        if isinstance(nested, dict):
+            return cls.from_dict(nested, eps=eps)
+        return cls.from_dict(ckpt, eps=eps)
 
