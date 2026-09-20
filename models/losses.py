@@ -73,6 +73,24 @@ def _complex_total_amp(field, eps=1e-12):
     return torch.sqrt(field[:, 0::2] ** 2 + field[:, 1::2] ** 2 + eps)
 
 
+def field_geom_loss_eh(pred, true, **kw):
+    """全场几何损失，E/H 分组各自算完再平均（12 通道版）。
+
+    背景：`field_geom_loss` 只读传入张量的前 6 个通道、当作 3 个复分量
+    `(0,1),(2,3),(4,5)`。`tools/eval.py` 曾经直接把 12 通道张量喂进去，
+    拿到的其实是**只有电场**的 geom，而它自己的 docstring 写着"12 通道整体算的"，
+    于是终端上打印的 Geom 与 `tools/train.py` 的 `val_geom` 口径悄悄不一致。
+
+    这里把 E/H 拆分集中到一处，训练与评估共用，避免各处再手写切片。
+    低于 12 通道时退回单组计算（兼容旧的 6 通道 E-only 模型）。
+    """
+    v_e, _ = field_geom_loss(pred[:, :6], true[:, :6], **kw)
+    if pred.shape[1] >= 12:
+        v_h, _ = field_geom_loss(pred[:, 6:12], true[:, 6:12], **kw)
+        return (v_e + v_h) * 0.5
+    return v_e
+
+
 def e_h_total_rel_l2(pred, true, eps=1e-6, h_boost=1.0):
     """
     E/H 分组【总场幅值】相对 L2，再平均（物理空间）。

@@ -51,10 +51,18 @@ from core.registry import available as available_models, build_model
 from configs import base as C
 from data.dataset import EMMultiFreqDataset
 from models.losses import (
-    field_rel_l2_loss, field_geom_loss, freq_band_loss, dc_ac_rel_loss,
-    dc_ac_directional_mean_loss, highfreq_suppress_loss, e_h_total_rel_l2,
-    channel_group_balanced_l2,
+    field_rel_l2_loss, field_geom_loss, field_geom_loss_eh, freq_band_loss,
+    dc_ac_rel_loss, dc_ac_directional_mean_loss, highfreq_suppress_loss,
+    e_h_total_rel_l2, channel_group_balanced_l2,
 )
+
+
+def _grads_finite(model):
+    """所有参数的梯度是否都有限（None 视为有限，即该参数本轮未参与）。"""
+    for p in model.parameters():
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            return False
+    return True
 
 
 def parse_args(argv=None):
@@ -304,6 +312,8 @@ class Trainer:
         self.history = {"train": [], "val": []}
         self.best_val = float("inf")
         self.best_epoch = 0
+        self.best_metrics = {"val_loss": float("nan"), "val_rel": float("nan"),
+                             "val_geom": float("nan"), "epoch": 0}
         self.patience = 0
         self.only_save_pth = bool(getattr(C, "ONLY_SAVE_PTH", False))
         if self.only_save_pth:
@@ -531,22 +541,12 @@ class Trainer:
 
         # 2) 全场几何（E/H 各自算再平均；方向角/相位天然尺度不变）
         if w[2] != 0.0:
-            v_e, _ = field_geom_loss(
-                pred_w[:, :6], true_w[:, :6],
+            v = field_geom_loss_eh(
+                pred_w, true_w,
                 w_dir=float(getattr(C, "FIELD_DIR_ANGLE_WEIGHT", 1.0)),
                 w_phase=float(getattr(C, "FIELD_COMPLEX_PHASE_WEIGHT", 1.0)),
                 w_mag=float(getattr(C, "FIELD_TOTAL_MAG_WEIGHT", 1.0)),
             )
-            v = v_e
-            # 磁场 geom loss（后 6 通道，仅 12 通道时生效）
-            if pred_w.shape[1] >= 12:
-                v_h, _ = field_geom_loss(
-                    pred_w[:, 6:12], true_w[:, 6:12],
-                    w_dir=float(getattr(C, "FIELD_DIR_ANGLE_WEIGHT", 1.0)),
-                    w_phase=float(getattr(C, "FIELD_COMPLEX_PHASE_WEIGHT", 1.0)),
-                    w_mag=float(getattr(C, "FIELD_TOTAL_MAG_WEIGHT", 1.0)),
-                )
-                v = (v_e + v_h) * 0.5
             loss = loss + w[2] * v
 
         # 3) 通道DC/AC（稳定版，归一化空间）
@@ -612,14 +612,17 @@ class Trainer:
         return self.channel_mean_rel_l2_error(pred_p, true_p)
 
     def geom_metric(self, pred, true):
-        """物理空间 geom 误差（方向角+相位+幅值），用作保存/早停指标。"""
+        """物理空间 geom 误差（方向角+相位+幅值），用作保存/早停指标。
+
+        注意：这里**故意**用 field_geom_loss 的默认子权重（1/1/1），
+        而训练项 L3 用的是 FIELD_DIR_ANGLE_WEIGHT/FIELD_COMPLEX_PHASE_WEIGHT/
+        FIELD_TOTAL_MAG_WEIGHT（默认 2/2/4）。指标要的是一个等权的、可跨实验
+        横向比较的几何误差，不应随训练权重漂移——两者不同是刻意的，
+        但这也意味着改动 L3 子权重**不会**改变 best.pth 的选择判据。
+        """
         pred_p = self._denorm_output(pred)
         true_p = self._denorm_output(true)
-        v_e, _ = field_geom_loss(pred_p[:, :6], true_p[:, :6])
-        if pred_p.shape[1] >= 12:
-            v_h, _ = field_geom_loss(pred_p[:, 6:12], true_p[:, 6:12])
-            return (v_e + v_h) * 0.5
-        return v_e
+        return field_geom_loss_eh(pred_p, true_p)
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -668,9 +671,20 @@ class Trainer:
             if not torch.isfinite(loss):
                 print(f"\n[警告] Epoch {epoch}: 损失为 {loss.item()}，跳过此batch")
                 continue
-            
+
             self.optimizer.zero_grad()
             loss.backward()
+
+            # 反向之后必须再查一次梯度：上面的 isfinite 只看损失值，而
+            # log 归一化的反变换是 expm1，其导数 exp 可以在损失本身仍有限时
+            # 溢出成 inf/NaN。clip_grad_norm_ **不会**清洗 NaN —— NaN 的总范数
+            # 会让 scale 也变成 NaN，于是**所有**梯度一起变 NaN，optimizer.step()
+            # 之后整份权重永久损坏，而终端只看到 loss 正常下降。
+            if not _grads_finite(self.model):
+                print(f"\n[警告] Epoch {epoch}: 梯度含 NaN/Inf，跳过此batch（不入 step）")
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
             clip_max_norm = float(getattr(C, "GRAD_CLIP_MAX_NORM", 1.0))
             if clip_max_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_max_norm)
@@ -740,6 +754,10 @@ class Trainer:
                 self.best_val = val_save_rel
                 self.best_epoch = epoch
                 self.patience = 0
+                # 记录**最佳轮**的全部指标：summary.json 里 val_geom/val_rel/
+                # best_val_loss 必须来自同一轮，否则跨模型比较时是在比不同 epoch。
+                self.best_metrics = {"val_loss": val_loss, "val_rel": val_rel,
+                                     "val_geom": val_save_rel, "epoch": epoch}
                 self._save(f"{C.SAVE_DIR}/best.pth", epoch,
                            val_loss, val_rel, val_save_rel)
             else:
@@ -751,14 +769,21 @@ class Trainer:
         if not self.only_save_pth:
             self._save_curve()
         print(f"\n训练完成！最佳保存指标: {self.best_val:.6f} (epoch {self.best_epoch})")
-        self.write_summary(val_loss, val_rel, val_save_rel)
+        self.write_summary()
         return {"model": self.model_name, "n_params": self.n_params,
-                "val_geom": self.best_val, "val_rel": val_rel,
+                "val_geom": self.best_metrics["val_geom"],
+                "val_rel": self.best_metrics["val_rel"],
                 "best_epoch": self.best_epoch}
 
-    def write_summary(self, val_loss, val_rel, val_geom):
-        """写 summary.json —— tools/compare.py 汇总表的输入。"""
+    def write_summary(self):
+        """写 summary.json —— tools/compare.py 汇总表的输入。
+
+        全部指标取自**同一个最佳轮**（`self.best_metrics`）。原先 val_geom 取
+        最佳轮、而 val_rel / best_val_loss 取最后一轮的局部变量，早停后两者
+        可能相差很多轮，按 val_rel 横向比模型时等于在比不同 epoch。
+        """
         import json
+        bm = self.best_metrics
         summary = {
             "model": self.model_name,
             "experiment": getattr(C, "ACTIVE_EXPERIMENT", None),
@@ -773,9 +798,9 @@ class Trainer:
             "lora_rank": self.model_cfg.lora_rank,
             "epochs": C.N_EPOCHS,
             "best_epoch": self.best_epoch,
-            "val_geom": float(self.best_val),
-            "best_val_loss": float(val_loss),
-            "val_rel": float(val_rel),
+            "val_geom": float(bm["val_geom"]),
+            "best_val_loss": float(bm["val_loss"]),
+            "val_rel": float(bm["val_rel"]),
             "model_config": self.model_cfg.to_dict(),
         }
         p = os.path.join(C.SAVE_DIR, "summary.json")

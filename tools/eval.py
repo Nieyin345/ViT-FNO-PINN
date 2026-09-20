@@ -36,7 +36,7 @@ import models  # noqa: F401  触发自注册
 from core.checkpoint import load as load_checkpoint
 from configs import base as C
 from data.dataset import EMMultiFreqDataset
-from models.losses import field_geom_loss
+from models.losses import field_geom_loss_eh
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -94,7 +94,7 @@ def evaluate(model, loader, normalizer, name):
 
     注意：这里的口径与 `tools/train.py` 的验证口径**不同**（本轮不改，保持一致
     以免与历史评估数字对不上）：
-      - 本文件的 Geom 是 12 通道整体算的；Trainer 是 E(前6)/H(后6) 分组平均。
+      - 本文件的 Geom 是 E/H 分组平均（与 Trainer 的 `geom_metric` 同）。
       - 本文件的 RelL2 是 12 通道整体展平的相对 L2；Trainer 用
         `channel_group_balanced_l2`（分组归一后平均）。
     两者都随 checkpoint 一起记录在 `summary.json` / 终端输出里，跨文件比较时
@@ -111,7 +111,7 @@ def evaluate(model, loader, normalizer, name):
         if normalizer is not None:
             pred = normalizer.denormalize(pred)
 
-        g, _ = field_geom_loss(pred, tgt)
+        g = field_geom_loss_eh(pred, tgt)
         geom_errors.append(g.item())
 
         b = pred.shape[0]

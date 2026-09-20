@@ -108,6 +108,7 @@ class FNO2dFiLM(FNOBase):
     def build_cond(self, x, freq):
         if freq is None:
             return None
+        # freq = (B,2) 整列传入：第 0 列走傅里叶特征，第 1 列(极化)作为标量并入。
         return Cond(freq_emb=self.freq_encoder(freq), geom_emb=self.geom_encoder(x))
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:

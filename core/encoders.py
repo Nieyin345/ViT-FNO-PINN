@@ -22,25 +22,44 @@ import torch.nn as nn
 class FourierFreqEncoder(nn.Module):
     """频率条件编码：多尺度 sin/cos 傅里叶特征 → MLP。
 
-    接受 (B,1) 旧接口与 (B,2)=[归一化频率, 极化] 新接口。
-    多列时**按列分别编码后求平均**（频率与极化被混叠，故 FNO2dV2 改用 pol_mlp 分开处理）。
+    输入约定为 `(B, 1 + extra_cols)`：第 0 列是归一化频率，其余列是本编码器
+    顺带承载的额外标量（通常是极化）。**各列走不同的通路，不再混叠**：
+
+        第 0 列  →  sin/cos 傅里叶特征（2*n_freqs 维）
+        其余列  →  直接作为标量拼进 MLP 输入
+
+    传入的列数少于 `1 + extra_cols` 时按 0 补齐（fno_v2 的极化走独立 pol_mlp，
+    这里补 0 即可，不影响数值）。
+
+    重构修正：原实现对 `(B,2)` 输入**按列分别编码后求平均**
+    （`self.mlp(x).mean(dim=1)`），把频率与极化平均进同一个嵌入。
+    fno_attention / fno_film / fno_lora 都是直接把 `(B,2)=[freq,pol]` 交给它，
+    于是 [8GHz, pol=0] 与 [12GHz, pol=1] 编码出**完全相同**的向量
+    （实测相对位移 0.0000），网络结构上无法区分这两个条件。
     """
 
-    def __init__(self, n_freqs: int = 16, out_dim: int = 32):
+    def __init__(self, n_freqs: int = 16, out_dim: int = 32, extra_cols: int = 1):
         super().__init__()
         scales = 2 ** torch.linspace(0, 4, n_freqs)
         self.register_buffer("scales", scales)
+        self.extra_cols = int(extra_cols)
         self.mlp = nn.Sequential(
-            nn.Linear(2 * n_freqs, 64), nn.GELU(),
+            nn.Linear(2 * n_freqs + self.extra_cols, 64), nn.GELU(),
             nn.Linear(64, out_dim),
         )
 
     def forward(self, freq: torch.Tensor) -> torch.Tensor:
         if freq.ndim == 1:
             freq = freq.unsqueeze(0)
-        x = freq.unsqueeze(-1) * self.scales                      # (B, K, N)
-        x = torch.cat([torch.sin(x), torch.cos(x)], dim=-1)       # (B, K, 2N)
-        return self.mlp(x).mean(dim=1)
+        f = freq[:, 0:1]                                          # (B,1) 归一化频率
+        x = f.unsqueeze(-1) * self.scales                          # (B,1,N)
+        x = torch.cat([torch.sin(x), torch.cos(x)], dim=-1)        # (B,1,2N)
+        x = x.reshape(x.size(0), -1)                               # (B,2N)
+        extra = freq[:, 1:1 + self.extra_cols]                     # (B,<=extra_cols)
+        if extra.size(1) < self.extra_cols:
+            pad = extra.new_zeros(extra.size(0), self.extra_cols - extra.size(1))
+            extra = torch.cat([extra, pad], dim=1)
+        return self.mlp(torch.cat([x, extra], dim=1))
 
 
 class SDFGeomEncoder(nn.Module):

@@ -70,6 +70,10 @@ class FNO2d(FNOBase):
     def build_cond(self, x, freq):
         if freq is None:
             return None
+        # freq = (B,2) = [归一化频率, 极化]。整列交给编码器：
+        # 第 0 列走傅里叶特征，第 1 列(极化)作为标量并入 MLP。**不要**只传前 1 列，
+        # 否则极化信息整条丢失（原先误传整列，则两列被平均混叠，8GHz+pol1 与
+        # 12GHz+pol0 编码出同一向量）。
         return Cond(freq_emb=self.freq_encoder(freq), geom_emb=self.geom_encoder(x))
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:

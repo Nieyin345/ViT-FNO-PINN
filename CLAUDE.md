@@ -153,9 +153,22 @@ checkpoint 里**存构建配置**，加载时不再靠猜：
 | 出处 | Geom | RelL2 |
 |---|---|---|
 | `tools/train.py`（写入 `summary.json`，也是 `best.pth` 的判据） | E(前6)/H(后6) 分组平均 | `channel_group_balanced_l2`（分组归一后平均） |
-| `tools/eval.py` | 12 通道整体 | 12 通道整体展平的相对 L2 |
+| `tools/eval.py` | E(前6)/H(后6) 分组平均（与 Trainer 同，走同一个 `field_geom_loss_eh`） | 12 通道整体展平的相对 L2 |
 
 两者不可直接比大小。`val_geom` 是早停与保存最优模型的判据，不是 `val_rel`。
+
+`geom_metric` 故意用 `field_geom_loss` 的默认等权子权重（1/1/1），而训练项 L3 用
+`FIELD_DIR_ANGLE_WEIGHT` / `FIELD_COMPLEX_PHASE_WEIGHT` / `FIELD_TOTAL_MAG_WEIGHT`
+（默认 2/2/4）——指标要的是可跨实验横向比较的等权几何误差，不随训练权重漂移。
+**改 L3 子权重不会改变 best.pth 的判据。**
+
+`summary.json` 里 `val_geom` / `val_rel` / `best_val_loss` 全部取自**同一个最佳轮**
+（`Trainer.best_metrics`）。早期版本 `val_rel` 取的是最后一轮，早停后与 `val_geom`
+可能相差几十个 epoch，按它横向比模型等于在比不同 epoch。
+
+`field_geom_loss` 只读传入张量的**前 6 个通道**、当作 3 个复分量 `(0,1),(2,3),(4,5)`。
+12 通道张量直接喂进去只会算到电场。需要 E/H 分组时一律用 **`field_geom_loss_eh`**，
+不要再在调用点手写切片。
 
 ### 输出归一化（E/H 尺度差 3 个量级）
 
@@ -166,7 +179,7 @@ checkpoint 里**存构建配置**，加载时不再靠猜：
 
 ### 损失项是位置下标驱动的
 
-`LOSS_ENABLE_VECTOR` / `LOSS_WEIGHT_VECTOR` 是**长度 9 的列表，含义只存在于 `configs/base.py` 的注释里**，且 `models/losses.py::loss_fn` 内部用两套长度守卫（`len(w) > 7` / `len(w) > 8`）。改列表长度或顺序会影响所有实验。`L9`(PINN 麦克斯韦残差) 需要相邻 z 平面，只有 `v2` 体数据能提供；`v2_cache` 下开启会打警告且空转。
+`LOSS_ENABLE_VECTOR` / `LOSS_WEIGHT_VECTOR` 是**长度 9 的列表，含义只存在于 `configs/base.py` 的注释里**。`loss_fn` 不是 `models/losses.py` 里的函数，而是 **`tools/train.py::Trainer.loss_fn`**；其中 `len(w) > 7` / `len(w) > 8` 两处守卫是**不可达的死代码**（`_get_loss_weight_vector` 保证长度 ≥ 9）。索引本身没有运行期校验，**在列表中间插入一项会让其后所有损失项静默错位**。改列表长度或顺序会影响所有实验。`L9`(PINN 麦克斯韦残差) 需要相邻 z 平面，只有 `v2` 体数据能提供；`v2_cache` 下开启会打警告且空转。另外 `maxwell_pinn_loss` 的 `dx_mm = dy_mm = 30/64 = 0.46875` 与本仓库其余各处的 `15/63 = 0.2381` 不一致（差 1.97 倍），启用 L9 前须先核对网格口径。
 
 ### 数据格式
 
