@@ -31,6 +31,7 @@
 │   ├── fno2d.py       #   fno_attention（主模型）
 │   ├── fno2d_v2.py    #   fno_v2（正弦频率输入 + 核条件化）
 │   ├── fno2d_baseline.py / fno2d_film.py / fno2d_lora.py / unet2d.py
+│   ├── mlp2d.py / cnn2d.py / vit2d.py / afno2d.py / deeponet2d.py  # 对比基线族
 │   └── losses.py      #   损失函数（geom / DC-AC / 频域 / PINN）
 ├── tools/             # 可直接运行的入口
 │   ├── train.py       #   主训练（argparse 驱动）

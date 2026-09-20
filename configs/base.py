@@ -60,6 +60,9 @@ MODES2 = 8
 WIDTH = 64
 N_LAYERS = 5
 FREQ_DIM = 32
+# 边界 padding：频域卷积依赖周期边界，pad 一圈可减轻 wrap-around。
+# 纯逐点模型（mlp）用不上，设为 0 可省约 48% 的算力。
+PADDING = 7
 
 # 模型条件向量：freq (B,2) = [归一化频率, 极化索引]。
 # baseline/unet 通过 COND_CHANNELS 把多列条件广播进空间输入。
@@ -72,6 +75,11 @@ OUT_CHANNELS = 12
 #   single   - 共享头直接输出全部 12 通道（默认）
 #   em_split - 旧的 3 个 E 头 + 3 个 H 头（H 显式依赖 E 预测）
 HEAD_MODE = "single"
+
+# 模型专属结构参数的通道：整个 dict 原样进 `ModelConfig.extra`。
+# 新模型有基座没有的参数（如 AFNO 的分块数、ViT 的 patch 大小）就写在这里，
+# 不必改 core/config.py。示例：{"afno_blocks": 16, "vit_patch": 8}
+MODEL_EXTRA = {}
 
 # 输出头 dropout（0=关闭，0.05~0.1 适合轻度正则化，缓解小数据过拟合）
 PROJ_DROPOUT = 0.05
@@ -270,6 +278,7 @@ def model_config_from_globals(name: str = None):
         in_channels=int(get("IN_CHANNELS", 2)),
         out_channels=int(get("OUT_CHANNELS", 12)),
         freq_dim=int(get("FREQ_DIM", 32)),
+        padding=int(get("PADDING", 7)),
         cond_channels=int(get("COND_CHANNELS", 2)),
         use_pol_cond=bool(get("USE_POL_COND", True)),
         use_sine_input=bool(get("USE_SINE_INPUT", True)),
@@ -287,6 +296,8 @@ def model_config_from_globals(name: str = None):
             decay_k0=float(get("SPECTRAL_DECAY_K0", 6)),
             decay_order=int(get("SPECTRAL_DECAY_ORDER", 2)),
         ),
+        # 模型专属参数（新模型的扩展口）：实验条目里写 MODEL_EXTRA={...} 即可传入
+        extra=dict(get("MODEL_EXTRA", {}) or {}),
     )
     return cfg
 

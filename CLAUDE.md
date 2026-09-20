@@ -102,7 +102,11 @@ class FNO2dMyIdea(FNOBase):
 
 2. 在 `models/__init__.py` 加一行 `from . import <你的模型模块>`。
 
-块（block）的唯一协议是 `forward(self, x, cond: Cond | None = None)`。之后训练 / 评估 / GUI / S11 / 传播 / 对比实验六条链路全部自动认得它。
+块（block）的唯一协议是 `forward(self, x, cond=None)`（**注解写 `Optional[Cond]`，不要写 `Cond | None`——本地环境是 Python 3.8，`X | None` 在运行时求值会 `TypeError`**）。之后训练 / 评估 / GUI / S11 / 传播 / 对比实验六条链路全部自动认得它。
+
+模型专属的结构参数走 `cfg.extra` 字典，**不改 `core/config.py`**：在 `configs/base.py` 的 `MODEL_EXTRA`（或实验条目里的 `"MODEL_EXTRA": {...}`）写键值，模型里用 `cfg.extra.get("你的键", 默认值)` 读。实验条目里也能直接覆盖 `PADDING` 等基座参数（例如 `mlp` 用 1×1 卷积，设 `"PADDING": 0` 省算力）。
+
+已有 11 个模型可作模板：`mlp` / `cnn` 走"空间通道广播 + 基座骨架"；`afno` 走"编码器嵌入 + 基座骨架"；`vit` / `deeponet` 因为 token 化/乘积求和与基座骨架不兼容，**整体覆盖 `forward`**（但仍继承 `FNOBase` 以复用 `self.cfg`、`normalize_freq` 契约与注册机制）。
 
 ## 架构要点
 
@@ -112,7 +116,8 @@ class FNO2dMyIdea(FNOBase):
 - **`core/base.py::FNOBase`** 统一 lift / pad / block 级联 / crop / head，把模型差异收敛到三个钩子：`build_input`（V2 在这里拼正弦通道）、`build_cond`（产条件）、`output_head`（必填）。
 - **`Cond`** 取代原来的 `freq_emb=` / `geom_emb=` / `cond=` 三套互不兼容的块签名。`fused()` 按 `[freq, pol, geom]` 拼接，供核条件化块使用。
 - **`core/registry.py`** 是全仓库唯一的"模型名 → 类"映射，模型在自己文件里 `@register` 自注册。**未知名字一律抛错**并列出可选值（不再静默降级）。`build_model(name, cfg)` 是唯一构造入口。
-- 三种条件化方式都能落在同一骨架上：编码器嵌入（`fno_attention`/`fno_film`/`fno_lora`）走 `build_cond`；空间通道广播（`fno_baseline`/`unet`）走 `build_input` 拼常量条件图、`build_cond` 返回 `None`；混合（`fno_v2`）两个钩子都用。
+- 三种条件化方式都能落在同一骨架上：编码器嵌入（`fno_attention`/`fno_film`/`fno_lora`/`afno`）走 `build_cond`；空间通道广播（`fno_baseline`/`unet`/`mlp`/`cnn`）走 `build_input` 拼常量条件图、`build_cond` 返回 `None`；混合（`fno_v2`）两个钩子都用；`vit`/`deeponet` 因输出映射方式不同，整体覆盖 `forward`。
+- **`ModelConfig.extra` 是模型专属参数的唯一通道**，由 `configs/base.py::MODEL_EXTRA` 传入（见 `model_config_from_globals()`）。它参与 `to_dict`/`from_dict` 与 `__post_init__` 之前的构造，也随 checkpoint 一起存取——所以新增模型参数不需要动 `core/config.py`，但也要注意 **`extra` 里改了默认值会让旧 checkpoint 重建出不同结构**（`strict=True` 会报错，这是期望行为）。
 - **`freq` 的契约是 `(B, 2) = [归一化频率, 极化]`**，由 `data/dataset.py` 定义（每条样本给 `(2,)`，DataLoader 批成 `(B,2)`）。`normalize_freq()` 在 `FNOBase.forward` 入口和 `UNet2d.forward` 里统一补齐：1D 视为单样本、缺极化列补 0，batch 维不匹配则抛 `ValueError`。**新写调用点时按 `(B,2)` 传**，别依赖 1D 兜底；上一版就是因为各模型对 `freq` 的切片宽度不同（宽的靠广播侥幸跑通、窄的如 `fno_v2` 的 `freq[:, 1:2]` 直接 IndexError），同一个坏输入时崩时不崩。
 
 ### 配置的生效顺序

@@ -101,17 +101,65 @@ freq_dim=32, out_channels=12`，参数量约 **8.05M**。
 
 ### 对比模型（`models/`）
 
-| 模型 | 说明 |
-|------|------|
-| `fno2d_baseline.py` | 纯 FNO2d：无超网络/注意力，freq 展开为常数通道拼入输入（in=3） |
-| `fno2d_film.py` | FNO + FiLM 条件调制 |
-| `fno2d_lora.py` | FNO + LoRA 风格频率条件卷积核 |
-| `unet2d.py` | 纯空间域 U-Net 基线 |
+对比实验的设计原则：**每一对实验之间只差一个变量**。下面按"混合范围"与
+"混合发生在哪个域"两个维度铺开，这样任意两个模型的差异都能归因到具体因素。
 
-### 实验切换（`configs/experiments.py`）
+| 模型 | 注册名 | 混合范围 | 域 | 条件化方式 | 参数量\* |
+|------|--------|---------|----|-----------|---------|
+| `mlp2d.py` | `mlp` | **1×1**（无混合） | 空间 | 通道广播 | 0.09M |
+| `cnn2d.py` | `cnn` | 局部（3×3 + dilation） | 空间 | 通道广播 | 0.41M |
+| `unet2d.py` | `unet` | 多尺度（编解码 + skip） | 空间 | 通道广播 | 7.77M |
+| `vit2d.py` | `vit` | **全局** | 空间 | adaLN | 0.63M |
+| `afno2d.py` | `afno` | **全局** | 频域 | 超网络偏置 | 0.43M |
+| `fno2d_baseline.py` | `fno_baseline` | **全局** | 频域 | 通道广播 | 2.65M |
+| `deeponet2d.py` | `deeponet` | branch⊗trunk | 混合 | branch 条件 | 0.73M |
+| `fno2d.py` | `fno_attention` | 全局 | 频域 | 编码器 + 超网络注意力 | 8.03M |
+| `fno2d_v2.py` | `fno_v2` | 全局 | 频域 | 正弦输入 + 核条件化 | 2.79M |
+| `fno2d_film.py` | `fno_film` | 全局 | 频域 | 编码器 + FiLM | 2.93M |
+| `fno2d_lora.py` | `fno_lora` | 全局 | 频域 | 编码器 + LoRA 核扰动 | 3.64M |
+
+\* 参数量为 `width=64, n_layers=5, out_channels=12` 下的实测值（本地 CPU，供量级参考）。
+
+#### 各基线分别在回答什么问题
+
+| 对比 | 唯一变量 | 结论指向 |
+|------|---------|---------|
+| `mlp` vs `cnn` | 有无空间混合 | 空间结构是否必需（若 `mlp` 不差，该查指标而非堆模型） |
+| `cnn` vs `unet` | 是否有下采样/多尺度 | 超表面响应的多尺度性是否真实存在 |
+| `cnn` vs `vit` | 局部 vs 全局混合（同在空间域） | 全局混合本身是否带来收益 |
+| `vit` vs `afno` | 全局混合发生在空间域还是频域 | 频域参数化是否比空间域注意力更合适 |
+| `afno` vs `fno_baseline` | 每频率对是否独立调权 | **FNO 收益来自频域全局混合，还是来自逐频率自由度**（`afno` 严格弱于谱卷积：所有频率对共享一对矩阵，中间夹 GELU） |
+| `afno` vs `afno_blocks` | 权重共享粒度（1 组 → 16 组） | 上述拐点在哪里，用来定位"共享到什么程度就够了" |
+| `deeponet` vs 全部 | 显式 branch⊗trunk 分解 vs 隐式学习 | 目标场的空间模式能否由**几何无关的全局基函数**张成；差则说明局域绕射结构是必需的 |
+| `fno_film` / `fno_lora` / `fno_v2` / `fno_attention` | 条件注入方式 | 条件信息以何种方式进入频域算子最有效 |
+
+条件化方式的三类对应关系（都落在同一骨架上，见 `CLAUDE.md`）：
+"空间通道广播"（`mlp`/`cnn`/`unet`/`fno_baseline`）走 `build_input`；
+"编码器嵌入"（`fno_attention`/`fno_film`/`fno_lora`/`afno`）走 `build_cond`；
+混合（`fno_v2`/`vit`/`deeponet`）两个钩子都用或整体覆盖 `forward`。
+
+#### 新基线专属参数（走 `ModelConfig.extra`，不改 `core/config.py`）
+
+`configs/base.py` 的 `MODEL_EXTRA` 字典整个原样进 `cfg.extra`，实验条目里写
+`"MODEL_EXTRA": {...}` 即可传入。当前用到的键：
+
+| 键 | 模型 | 默认 | 含义 |
+|----|------|------|------|
+| `mlp_hidden` | `mlp` | `2×width` | 逐点 MLP 隐层宽度 |
+| `cnn_dilation_cycle` | `cnn` | 3 | 膨胀循环长度（1,2,4,1,2,4,…） |
+| `vit_patch` | `vit` | 8 | patch 边长（64/8 → 8×8=64 个 token） |
+| `vit_heads` | `vit` | 4 | 注意力头数 |
+| `vit_dim` | `vit` | `width` | token 维度 |
+| `afno_hidden_ratio` | `afno` | 2.0 | 频域 MLP 隐层相对宽度的倍数 |
+| `afno_blocks` | `afno` | 0 | 频谱分块数（0=全局共享；>0 则 blocks² 组各自独立权重） |
+| `deeponet_basis` | `deeponet` | 128 | basis 个数 p |
+
+#### 实验切换（`configs/experiments.py`）
 
 改 `ACTIVE_EXPERIMENT` 即可切换 `fno_attention / fno_baseline / fno_baseline_large /
-fno_baseline_parity(参数量对齐~8M) / fno_lora / fno_film / unet`，保存路径自动隔离到 `checkpoints/<name>/`。
+fno_baseline_parity(参数量对齐~8M) / fno_lora / fno_film / unet / fno_v2 系列 /
+mlp / cnn / vit / afno / afno_blocks / deeponet`，保存路径自动隔离到
+`checkpoints/<name>/`。
 
 ---
 
