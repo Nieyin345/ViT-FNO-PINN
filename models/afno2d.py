@@ -95,13 +95,26 @@ class AFNOBlock(nn.Module):
         B, C, H, W = x.shape
         x_ft = torch.fft.rfft2(x.float())
 
-        # 只对低频块做变换（高频保留原样），与 FNO 的 modes1/modes2 取法一致
-        m1 = min(self.modes, x_ft.size(2))
+        # 参与变换的低频块：**正负 kx 两块都要取**。
+        #
+        # rfft2 的实轴是完整的 kx（长度 H），负频在末尾。FNO 的 w1 取
+        # kx∈{0..m1-1}、w2 取 kx∈{-m1..-1}，两者合起来才是一个**中心对称**的
+        # 低频窗。本文件原先只取 `x_ft[:, :, :m1, :m2]` 一块 —— 注释写着
+        # "与 FNO 的 modes1/modes2 取法一致"，实际只覆盖了一半。
+        # 这不是"少学一点"，而是让 AFNO 与 FNO 的对比**多出一个变量**：
+        # AFNO 存在的唯一意义是"共享权重 vs 每频率独立调权"，频域覆盖必须对齐，
+        # 否则 afno ≉ fno_baseline 时无法归因。
+        #
+        # 两块共享同一组 w1/w2（n_groups 与块数无关），所以拼起来做一次变换
+        # 与分别做两次**数学上完全等价**，只是省一次 einsum。
+        # 注意 `blocks>0` 的分块模式会沿这条拼接缝切块，缝两侧的频率对被归进
+        # 同一组 —— 该模式本就是插值用的实验旋钮，不做特殊处理。
+        m1 = min(self.modes, x_ft.size(2) // 2)
         m2 = min(self.modes, x_ft.size(3))
-        low = x_ft[:, :, :m1, :m2]                        # (B, C, m1, m2) complex
+        low = torch.cat([x_ft[:, :, :m1, :m2], x_ft[:, :, -m1:, :m2]], dim=2)
 
-        # (B, C, m1, m2) → (B, n_groups, group_size, C)
-        grouped = self._to_groups(low, m1, m2)            # (B, G, S, C)
+        # (B, C, 2·m1, m2) → (B, n_groups, group_size, C)
+        grouped = self._to_groups(low, 2 * m1, m2)        # (B, G, S, C)
 
         # 逐频率对的复数 MLP
         h = torch.einsum("bgsc,gch->bgsh", grouped, self.w1) + self.b1.view(1, self.n_groups, 1, -1)
@@ -113,7 +126,7 @@ class AFNOBlock(nn.Module):
         h = torch.complex(F.gelu(h.real), F.gelu(h.imag))
         out = torch.einsum("bgsh,ghc->bgsc", h, self.w2) + self.b2.view(1, self.n_groups, 1, -1)
 
-        out = self._from_groups(out, B, C, m1, m2)         # (B, C, m1, m2) complex
+        out = self._from_groups(out, B, C, 2 * m1, m2)     # (B, C, 2·m1, m2) complex
 
         # 逐通道 scale（频率条件）
         if freq_emb is not None:
@@ -122,7 +135,8 @@ class AFNOBlock(nn.Module):
             out = out * (1.0 + scale)
 
         out_ft = x_ft.clone()
-        out_ft[:, :, :m1, :m2] = out
+        out_ft[:, :, :m1, :m2] = out[:, :, :m1]
+        out_ft[:, :, -m1:, :m2] = out[:, :, m1:]
 
         y = torch.fft.irfft2(out_ft, s=(H, W)).to(x.dtype)
         y = self.channel_mix(y)

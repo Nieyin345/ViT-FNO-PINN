@@ -44,7 +44,14 @@ class SpectralConv2dVanilla(nn.Module):
 
 
 class FNOBlockVanilla(nn.Module):
-    """标准 FNO block：频域卷积 + bypass Conv1×1 + BN + GELU。"""
+    """标准 FNO block：频域卷积 + bypass Conv1×1 + BN + GELU + **残差**。
+
+    `+ x` 是 FNO 原论文的写法，也与 fno2d / fno2d_v2 / fno2d_lora 的 block 一致。
+    本文件原先漏了这一项：别的 block 是 `norm(f(x) + x)`，它是 `norm(f(x))`。
+    配上 5 层 Depth 又自带 bypass，残差并不是"能不能训"的必要条件，但它让
+    fno_baseline 与其它 FNO 变体的差异**多了一个变量**——而它存在的意义
+    恰恰是当"同容量、同结构、只少条件化"的干净对照。补上。
+    """
 
     def __init__(self, width: int, modes1: int, modes2: int):
         super().__init__()
@@ -53,7 +60,7 @@ class FNOBlockVanilla(nn.Module):
         self.norm = nn.BatchNorm2d(width)
 
     def forward(self, x, cond=None):
-        return F.gelu(self.norm(self.spectral(x) + self.bypass(x)))
+        return F.gelu(self.norm(self.spectral(x) + self.bypass(x) + x))
 
 
 @register("fno_baseline")
@@ -67,11 +74,6 @@ class FNO2dBaseline(FNOBase):
         super().__init__(cfg)
         self.in_channels = cfg.in_channels
         self.cond_channels = int(cfg.cond_channels)
-        # lift 实际接收 in_channels + cond_channels（基座按 cfg.in_channels 建的，这里重建）
-        self.lift = nn.Sequential(
-            nn.Conv2d(self.in_channels + self.cond_channels, cfg.width, kernel_size=1),
-            nn.GELU(),
-        )
 
         self.blocks = nn.ModuleList([
             FNOBlockVanilla(cfg.width, cfg.modes1, cfg.modes2) for _ in range(cfg.n_layers)
@@ -82,6 +84,12 @@ class FNO2dBaseline(FNOBase):
             nn.GELU(),
             nn.Conv2d(64, cfg.out_channels, kernel_size=1),
         )
+
+    def lift_in_channels(self) -> int:
+        # 基座按 cfg.in_channels 建 lift；本模型额外拼 cond_channels 个条件图。
+        # **只读 self.cfg**：本方法在 super().__init__ 内部被调用，
+        # 那时本类 __init__ 里的 self.in_channels 还没赋值。
+        return int(self.cfg.in_channels) + int(self.cfg.cond_channels)
 
     def _broadcast_condition(self, x, freq):
         B, _, H, W = x.shape

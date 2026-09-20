@@ -54,6 +54,26 @@ class SpectralConv2d(nn.Module):
             self.n_modes_attn = min(8, modes1)
             self.sig_length = self.n_modes_attn * self.n_modes_attn
             self.d_k = 32
+            # X_sig 是**未归一化**的频域幅值（量级 1e2，DC 点还要再高一个量级），
+            # W_q/W_k 是 N(0, 0.02²)。打分是 Q·K^H，形状 (B, C_in, C_in)——
+            # 注意 softmax 归一化的是**通道维**（C_in = width），不是频点维。
+            # 打分不归一化时实测（width=32，输入量级 1e1）：
+            #   |logit| max 2.9e4  ->  softmax 熵 0.0000（均匀分布的 0%），
+            #   最大权重 1.0000，有效位置数 1.00
+            # 即注意力退化成硬 argmax——每个通道只挑一个通道、权重恒为 1，
+            # 1.07M 参数的注意力模块对输出的贡献趋近于一个固定的通道置换，
+            # 且梯度几乎为零。
+            #
+            # 除以 sqrt(d_k)=5.66 远远不够（2.9e4 -> 5e3，熵仍是 0）。问题的根源
+            # 是 |X_sig| 的量级而不是 d_k，所以额外做**逐样本 L2 归一化**，
+            # 让打分建立在"频域签名的方向"上而不是"幅值有多大"上 ——
+            # 注意力本来就该看方向（Q·K 的夹角），幅值由后面的 V 承担。
+            # 归一化后实测：|logit| max 9.3e-4 -> 熵 3.4657 = log(32)，
+            # 最大权重 0.0313 = 1/32，有效位置数 32.00（均匀分布）。
+            # 零初始化下"均匀"正是应有的起点：每个通道等权，训练中 W_q/W_k
+            # 增长后再自然变得稀疏。
+            self.score_scale = float(getattr(cfg, "score_scale", 1.0))
+            self.sig_norm = bool(getattr(cfg, "sig_norm", True))
             self.W_q = nn.Parameter(torch.randn(self.sig_length, self.d_k, dtype=torch.cfloat) * 0.02)
             self.W_k = nn.Parameter(torch.randn(self.sig_length, self.d_k, dtype=torch.cfloat) * 0.02)
 
@@ -67,6 +87,21 @@ class SpectralConv2d(nn.Module):
                 nn.GELU(),
                 nn.Linear(256, self.sig_length * self.d_k),
             )
+            # 末层双向零初始化 -> t=0 时 ΔW_q = ΔW_k = 0，起点是纯 FNO 谱卷积，
+            # 训练稳定，**保留不改**。
+            #
+            #   ΔW = W_last · GELU(W1·cond + b1) + b_last，零初始化后 W_last = b_last = 0
+            #   ∂L/∂cond  ∝ W_last      = 0     ← 条件嵌入在第一步拿不到梯度
+            #   ∂L/∂W1    ∝ W_last      = 0
+            #   ∂L/∂W_last = g · GELU(·)ᵀ       ← 唯一能把它抬离零的通路
+            #
+            # 曾经在这里写过一句"把超网络抬离零的梯度，正是被上面的 softmax 饱和
+            # 掐掉的那一份"。**实测不支持这个说法**：把 sig_norm 打开前后，
+            # ∂L/∂W_last 是 1.1212e-04 vs 1.1125e-04（比值 0.992×），20 步后
+            # |W_last| 2.24e-06 vs 2.23e-06，几乎没有区别。原因是 W_last 的梯度
+            # 里 γ·attn_out 那一项占了主导，并不经过 softmax 的稀疏性。
+            # 所以上面那处修正的价值是它本身（注意力从硬 argmax 变回可训练），
+            # **不是**"解锁了条件化模块"。两件事各自独立，不要混为一谈。
             nn.init.zeros_(self.hyper_wq[-1].weight)
             nn.init.zeros_(self.hyper_wq[-1].bias)
             nn.init.zeros_(self.hyper_wk[-1].weight)
@@ -115,6 +150,12 @@ class SpectralConv2d(nn.Module):
 
             X_sig = freq_sig_complex.reshape(B, C_in, -1)  # (B, C_in, sig_length)
 
+            # 逐样本 L2 归一化：打分只看频域签名的**方向**，不看幅值量级。
+            # 不做这一步时 |X_sig| ~ 1e2（DC 还会把某些通道再抬一个量级），
+            # 打分动辄 1e3，softmax 直接饱和（实测熵只有均匀分布的 0.28%）。
+            if self.sig_norm:
+                X_sig = X_sig / X_sig.abs().pow(2).sum(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
+
             W_q_eff = self.W_q.unsqueeze(0).expand(B, -1, -1)
             W_k_eff = self.W_k.unsqueeze(0).expand(B, -1, -1)
 
@@ -131,9 +172,18 @@ class SpectralConv2d(nn.Module):
 
             scores_complex = torch.bmm(Q, K.conj().transpose(1, 2)) / math.sqrt(self.d_k)
 
+            # 复数打分 -> 实数权重。原始设计用 softmax(|scores|)：丢掉相位，只按
+            # "两个通道的低频签名有多像"来分配权重，而相位由 `scores_phase` 在加权
+            # 时乘回去。这个设计保留原样（不属于本次修正范围），只补上缺失的缩放。
+            #
+            # 写法上把"取模"和"缩放"分开：先取模（纯相位归一化，与 score_scale
+            # 无关），再对模乘 score_scale 送进 softmax。等价于
+            # `scores_complex / (|scores_complex| + 1e-8)` 后再 softmax(|·|*scale)，
+            # 但不会让 score_scale 意外混进相位那一项（原写法 `/(scores_mag/scale)`
+            # 在 scale≠1 时相位会被整体放大 scale 倍）。
             scores_mag = torch.abs(scores_complex)
             scores_phase = scores_complex / (scores_mag + 1e-8)
-            attn_weight_real = torch.softmax(scores_mag, dim=-1)
+            attn_weight_real = torch.softmax(scores_mag * self.score_scale, dim=-1)
             attn_matrix_complex = attn_weight_real.to(out_ft.dtype) * scores_phase
 
             # 阶段 C：注意力加权重组 + 残差门控

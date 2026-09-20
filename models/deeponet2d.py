@@ -92,6 +92,8 @@ class DeepONet2d(FNOBase):
         super().__init__(cfg)
         self.p = int(cfg.extra.get("deeponet_basis", 128))
 
+        # 频率编码器在 forward 里显式调用：cond = self.freq_encoder(freq)，
+        # 再交给 branch 拼进 mlp 输入。**不要**误读成"branch 自己编条件"而删掉它。
         self.freq_encoder = FourierFreqEncoder(n_freqs=16, out_dim=cfg.freq_dim)
         cond_dim = cfg.freq_dim
 
@@ -110,13 +112,22 @@ class DeepONet2d(FNOBase):
 
     def _coords(self, H: int, W: int, device, dtype) -> torch.Tensor:
         """归一化到 [-1,1]² 的网格坐标 (H·W, 2)。"""
-        key = (H, W, str(device))
+        # dtype 也进 key：缓存的是张量，dtype 变了不能复用
+        key = (H, W, str(device), str(dtype))
         if key not in self._coords_cache:
             ys = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
             xs = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
             yy, xx = torch.meshgrid(ys, xs, indexing="ij")
             self._coords_cache[key] = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
         return self._coords_cache[key]
+
+    def build_lift(self) -> nn.Module:
+        """本模型整体覆盖 forward，基座骨架用不上 —— lift 建成恒等。
+
+        否则基座会按 `cfg.in_channels` 建一个 Conv2d，它进 state_dict、
+        进优化器，却因为没有调用点而**永远拿不到梯度**（实测就是这两个参数）。
+        """
+        return nn.Identity()
 
     # DeepONet 的输出映射（乘积求和）与基座骨架不同，整体覆盖 forward
     def forward(self, x: torch.Tensor, freq: Optional[torch.Tensor] = None) -> torch.Tensor:

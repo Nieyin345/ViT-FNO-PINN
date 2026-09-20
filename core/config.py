@@ -45,6 +45,11 @@ class SpectralConfig:
     decay: bool = False               # 频域 Butterworth 衰减
     decay_k0: float = 6.0
     decay_order: int = 2
+    # ---- 注意力打分的数值稳定（原实现缺失，导致 softmax 饱和）----
+    # sig_norm: 对 X_sig 做逐样本 L2 归一化，让打分基于"频域签名的方向"而非幅值
+    # score_scale: 再乘一个整体缩放（默认 1.0，归一化后已够）
+    sig_norm: bool = True
+    score_scale: float = 1.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -55,11 +55,8 @@ class MLP2d(FNOBase):
         # extra 里的同名键优先，缺省取 width 的 2 倍
         self.hidden = int(cfg.extra.get("mlp_hidden", cfg.width * 2))
 
-        # lift 实际接收 in_channels + cond_channels（基座按 cfg.in_channels 建的，这里重建）
-        self.lift = nn.Sequential(
-            nn.Conv2d(self.in_channels + self.cond_channels, cfg.width, kernel_size=1),
-            nn.GELU(),
-        )
+        # 注意 lift 在基座 super().__init__ 里就建好了，这里**不能**再赋值
+        # （重建会把基座那个模块留在 _modules 里成为死参数，还会进优化器）。
         self.blocks = nn.ModuleList([
             PointwiseBlock(cfg.width, self.hidden, dropout=cfg.dropout)
             for _ in range(cfg.n_layers)
@@ -69,6 +66,11 @@ class MLP2d(FNOBase):
             nn.GELU(),
             nn.Conv2d(64, cfg.out_channels, kernel_size=1),
         )
+
+    def lift_in_channels(self) -> int:
+        # 基座按 cfg.in_channels 建 lift；本模型额外拼 cond_channels 个条件图。
+        # 只读 self.cfg —— 本方法在 super().__init__ 内部被调用。
+        return int(self.cfg.in_channels) + int(self.cfg.cond_channels)
 
     def _broadcast_condition(self, x, freq):
         B, _, H, W = x.shape

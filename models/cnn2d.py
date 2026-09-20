@@ -63,11 +63,8 @@ class CNN2d(FNOBase):
         self.cond_channels = int(cfg.cond_channels)
         self.dilation_cycle = max(1, int(cfg.extra.get("cnn_dilation_cycle", 3)))
 
-        # lift 实际接收 in_channels + cond_channels（基座按 cfg.in_channels 建的，这里重建）
-        self.lift = nn.Sequential(
-            nn.Conv2d(self.in_channels + self.cond_channels, cfg.width, kernel_size=3, padding=1),
-            nn.GELU(),
-        )
+        # 注意 lift 在基座 super().__init__ 里就建好了，这里**不能**再赋值
+        # （重建会把基座那个模块留在 _modules 里成为死参数，还会进优化器）。
         self.blocks = nn.ModuleList([
             ResConvBlock(cfg.width, dilation=2 ** (i % self.dilation_cycle), dropout=cfg.dropout)
             for i in range(cfg.n_layers)
@@ -76,6 +73,18 @@ class CNN2d(FNOBase):
             nn.Conv2d(cfg.width, 64, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(64, cfg.out_channels, kernel_size=1),
+        )
+
+    def lift_in_channels(self) -> int:
+        # 基座按 cfg.in_channels 建 lift；本模型额外拼 cond_channels 个条件图。
+        # 只读 self.cfg —— 本方法在 super().__init__ 内部被调用。
+        return int(self.cfg.in_channels) + int(self.cfg.cond_channels)
+
+    def build_lift(self) -> nn.Module:
+        # 与 mlp / baseline 的 1×1 不同，本模型是空间卷积网络，lift 用 3×3
+        return nn.Sequential(
+            nn.Conv2d(self.lift_in_channels(), self.cfg.width, kernel_size=3, padding=1),
+            nn.GELU(),
         )
 
     def _broadcast_condition(self, x, freq):

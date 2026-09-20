@@ -107,8 +107,11 @@ class ViT2d(FNOBase):
         self.cond_proj = nn.Sequential(nn.Linear(cond_dim, embed_dim * 2), nn.GELU(),
                                        nn.Linear(embed_dim * 2, embed_dim))
 
-        # CLS token：条件向量替换它的初值（而非另加一个 token，省一次注意力）
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # CLS token 由条件向量**直接生成**（省一次注意力），所以没有可学习的
+        # 初值参数。原先这里有个 `self.cls_token = nn.Parameter(zeros(1,1,D))`，
+        # 只在 `freq is None` 的兜底分支里用到 —— 而训练/评估/传播全链路都带
+        # freq，它永远拿不到梯度，却照样进 state_dict 和优化器。
+        # freq=None 是"简化推理"路径，条件本就该是零，直接给零张量即可。
 
         # 基座的 lift→pad→块循环→crop 骨架在本模型里用不上：token 化要求
         # stride=patch 的卷积，与 padding 不兼容。故整体覆盖 forward，
@@ -120,6 +123,14 @@ class ViT2d(FNOBase):
         self.norm_out = nn.LayerNorm(embed_dim)
         # 逐 token → 逐像素：把 embed_dim 映射到 patch²×out_channels
         self.head = nn.Linear(embed_dim, self.patch * self.patch * cfg.out_channels)
+
+    def build_lift(self) -> nn.Module:
+        """本模型整体覆盖 forward，基座骨架用不上 —— lift 建成恒等。
+
+        否则基座会按 `cfg.in_channels` 建一个 Conv2d，它进 state_dict、
+        进优化器，却因为没有调用点而**永远拿不到梯度**。
+        """
+        return nn.Identity()
 
     # ViT 不走基座的 lift/pad/块循环，整体自己来（token 化与 padding 不兼容）
     def forward(self, x: torch.Tensor, freq: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -138,7 +149,9 @@ class ViT2d(FNOBase):
             cond_vec = torch.cat([self.freq_encoder(freq), self.geom_encoder(x)], dim=-1)
             cls = self.cond_proj(cond_vec).unsqueeze(1)                 # (B, 1, D)
         else:
-            cls = self.cls_token.expand(B, -1, -1)
+            # 无条件兜底路径：CLS 与 adaLN 条件都为 0（ada 末层本就零初始化，
+            # 无条件时 block 退化为恒等的标准 Transformer）
+            cls = tokens.new_zeros(B, 1, self.embed_dim)
         tokens = torch.cat([cls, tokens], dim=1)                        # (B, 1+N, D)
 
         for blk in self.blocks:

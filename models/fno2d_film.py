@@ -63,17 +63,33 @@ class SpectralConv2dFiLM(nn.Module):
         out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
             "bixy,ioxy->boxy", x_ft[:, :, -self.modes1:, :self.modes2], self.w2)
 
+        shift = None
         if freq_emb is not None and geom_emb is not None:
             c = torch.cat([freq_emb, geom_emb], dim=-1)
             film_params = self.film_net(c)
             scale = film_params[:, :self.out_channels].view(B, self.out_channels, 1, 1)
             shift = film_params[:, self.out_channels:].view(B, self.out_channels, 1, 1)
-            out_ft = out_ft * (1.0 + scale).to(out_ft.dtype) + shift.to(out_ft.dtype)
+            # 只有 scale 作用在频域：频域逐通道缩放 == 空域逐通道缩放。
+            # shift 必须留到 irfft2 之后在**空域**加 —— 在频域加常数，反变换回
+            # 空域是一个 **delta 冲激**（实测原点能量占比 1.0000），等于每层往
+            # 特征图原点打一个尖峰，不是 FiLM 语义里的"平移特征图"。
+            # 详见 models/fno2d_v2.py 里同一处的注释（那里记了两版错误注释的历史）。
+            out_ft = out_ft * (1.0 + scale).to(out_ft.dtype)
 
-        return torch.fft.irfft2(out_ft, s=(H, W)).to(x.dtype)
+        y = torch.fft.irfft2(out_ft, s=(H, W)).to(x.dtype)
+        if shift is not None:
+            y = y + shift.to(y.dtype)
+        return y
 
 
 class FNOBlockFiLM(nn.Module):
+    """FiLM 条件化 block：频域卷积 + bypass + BN + GELU + **残差**。
+
+    `+ x` 与 fno2d / fno2d_v2 / fno2d_lora 的 block 保持一致（原先只有它
+    和 fno_baseline 漏了这一项）。fno_film 是"动态投影矩阵 vs FiLM"这组
+    消融的 FiLM 一侧，两边的 block 结构必须对齐，否则差异里混进了残差。
+    """
+
     def __init__(self, width: int, modes1: int, modes2: int, freq_dim: int = 32):
         super().__init__()
         self.spectral = SpectralConv2dFiLM(width, width, modes1, modes2, freq_dim=freq_dim)
@@ -81,7 +97,7 @@ class FNOBlockFiLM(nn.Module):
         self.norm = nn.BatchNorm2d(width)
 
     def forward(self, x, cond=None):
-        return F.gelu(self.norm(self.spectral(x, cond) + self.bypass(x)))
+        return F.gelu(self.norm(self.spectral(x, cond) + self.bypass(x) + x))
 
 
 @register("fno_film")

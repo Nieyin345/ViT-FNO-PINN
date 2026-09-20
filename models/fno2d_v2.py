@@ -151,22 +151,37 @@ class SpectralConv2dV2(nn.Module):
             fp = self.film_net(c)  # (B, 2*out)
             scale = fp[:, :self.out_channels].view(B, self.out_channels, 1, 1)
             shift = fp[:, self.out_channels:].view(B, self.out_channels, 1, 1)
-            # 只对**非 DC** 频点做 scale/shift。
+            # FiLM 的两个动作分别作用在**不同的域**，这是本处修正的核心：
             #
-            # 原来是对整个 out_ft 做 `out_ft * (1+scale) + shift`，但 out_ft 的
-            # [:, :, 0, 0] 是 DC 分量，给它加常数在空域等于叠加一个原点处的
-            # 空间冲激（delta），而不是"平移特征图"——语义与 FiLM 的名字不符，
-            # 且会污染通道的直流分量（预测场是非零均值场，DC 有物理含义）。
+            #   scale：逐通道缩放。频域缩放 == 空域缩放（傅里叶变换是线性的），
+            #          所以直接乘在 out_ft 上，语义正确，保持原样。
             #
-            # 这里保持零初始化时**恒等**：scale=shift=0 → 乘 (1+0) 加 0，
-            # 与原来完全一致（起点行为不变，不破坏训练早期的稳定性）。
-            non_dc = out_ft[:, :, 1:, :]
-            out_ft = torch.cat([
-                out_ft[:, :, :1, :],
-                non_dc * (1.0 + scale).to(out_ft.dtype) + shift.to(out_ft.dtype),
-            ], dim=2)
+            #   shift：逐通道平移。**频域上没有"平移"这个操作**——在频域加常数，
+            #          反变换回空域是一个 **delta 冲激**（实测原点能量占比 1.0000），
+            #          即每层都往特征图原点打一个尖峰，而不是"整体抬高/压低"。
+            #          原实现写的是 `out_ft * (1+scale) + shift`，正是这个错误。
+            #
+            # 错误注释的历史（两版都错，记在这里免得再踩）：
+            #   第一版说"给 DC 加常数 = 原点冲激"——反了：只改 DC 得到的是**均匀
+            #     常数**（实测 std 1.8e-7）；得到冲激的是"给**全部**频点加常数"。
+            #   第二版改成了"只排除 DC 那一个点"——依然错：只排除 DC 后原点能量
+            #     占比仍是 0.9998，冲激还在，只是被减掉了一个均匀量。排除**整个
+            #     kx=0 行**同理（原点占比 0.9844），只是把冲激沿 y 展平。
+            #   三种写法都消不掉冲激，因为问题不在"改哪些频点"，而在**加法本身
+            #   就不该发生在频域**。
+            #
+            # 现在的做法：scale 留在频域乘，shift 挪到 irfft2 之后**空域相加**——
+            # 这才是 FiLM 语义下的逐通道平移（与 fno2d_film 的骨架一致）。
+            # 零初始化时 scale=shift=0，仍然**恒等**，起点行为不变。
+            out_ft = out_ft * (1.0 + scale).to(out_ft.dtype)
+        else:
+            shift = None
 
-        return torch.fft.irfft2(out_ft, s=(H, W)).to(x.dtype)
+        y = torch.fft.irfft2(out_ft, s=(H, W)).to(x.dtype)
+        if shift is not None:
+            # (B, C, 1, 1) 广播到 (B, C, H, W)：空域逐通道加偏置
+            y = y + shift.to(y.dtype)
+        return y
 
 
 class FNOBlockV2(nn.Module):
@@ -203,11 +218,6 @@ class FNO2dV2(FNOBase):
             self.pol_mlp = nn.Sequential(nn.Linear(1, 16), nn.GELU(), nn.Linear(16, 16))
         self.cond_dim = cfg.freq_dim + (16 if cfg.use_pol_cond else 0) + cfg.freq_dim
 
-        # lift 实际接收 in_channels + n_sine（基座按 cfg.in_channels 建的，这里重建）
-        self.lift = nn.Sequential(
-            nn.Conv2d(cfg.in_channels + self.n_sine, cfg.width, kernel_size=1),
-            nn.GELU(),
-        )
         self.blocks = nn.ModuleList([
             FNOBlockV2(cfg.width, cfg.modes1, cfg.modes2, cond_dim=self.cond_dim,
                        kernel_cond=cfg.kernel_cond, lora_rank=cfg.lora_rank)
@@ -219,6 +229,12 @@ class FNO2dV2(FNOBase):
             nn.GELU(),
             nn.Conv2d(64, cfg.out_channels, kernel_size=1),
         )
+
+    def lift_in_channels(self) -> int:
+        # 基座按 cfg.in_channels 建 lift；本模型额外拼 n_sine 个正弦通道。
+        # **只读 self.cfg**：本方法在 super().__init__ 内部被调用，
+        # 那时本类 __init__ 里的 self.n_sine 还没赋值。
+        return int(self.cfg.in_channels) + (4 if self.cfg.use_sine_input else 0)
 
     def _sine_embedding(self, x, freq):
         """频率相关的空间正弦嵌入：sin/cos(k0·L·x/y)，k0 由工作频率决定。

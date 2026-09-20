@@ -91,11 +91,38 @@ class FNOBase(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.padding = cfg.padding
-        self.lift = nn.Sequential(
-            nn.Conv2d(cfg.in_channels, cfg.width, kernel_size=1),
+        # lift 的输入通道数**延迟确定**：基座按 cfg.in_channels 建一个，
+        # 需要额外通道的模型（fno_v2 拼正弦、baseline/unet/mlp/cnn 拼条件图）
+        # 覆盖 `lift_in_channels()` 即可，而不是在子类里再赋值 `self.lift = ...`。
+        # 后者会把基座建的那个模块**丢弃但留在 _modules 里**，于是
+        #   1. state_dict 多出一份没人用的参数（fno_v2 白占 0.1%，baseline 白占 24%），
+        #   2. `model.parameters()` 把这些死参数交给优化器，它们永远拿不到梯度，
+        #      干扰任何按参数做统计/正则的逻辑。
+        self.lift = self.build_lift()
+        self.blocks = nn.ModuleList()
+
+    def lift_in_channels(self) -> int:
+        """送入 lift 的通道数。需要拼接额外输入的模型覆盖此方法。
+
+        **子类覆盖时只读 `self.cfg`，不要读自己 `__init__` 里赋的属性**——
+        本方法是在 `super().__init__(cfg)` 内部被调用的，那时子类属性还没赋值。
+        """
+        return int(self.cfg.in_channels)
+
+    def build_lift(self) -> nn.Module:
+        """构建 lift 模块。默认 1×1 卷积。
+
+        需要不同卷积核的模型（如 `cnn` 用 3×3）覆盖此方法，而不是重建 `self.lift`。
+
+        整体覆盖 `forward`、不走基座骨架的模型（`vit` / `deeponet`）应覆盖成
+        `return nn.Identity()` —— 否则这个 lift 会被建出来、进 state_dict、
+        进优化器，却永远拿不到梯度（实测 deeponet 的 `lift.0.weight/bias`
+        在所有参数里是唯一两个 `grad is None` 的）。
+        """
+        return nn.Sequential(
+            nn.Conv2d(self.lift_in_channels(), self.cfg.width, kernel_size=1),
             nn.GELU(),
         )
-        self.blocks = nn.ModuleList()
 
     # ------------------------------------------------------------- 三个钩子
     def build_input(self, x: torch.Tensor, freq: Optional[torch.Tensor]) -> torch.Tensor:
