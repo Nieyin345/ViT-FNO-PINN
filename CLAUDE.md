@@ -113,6 +113,7 @@ class FNO2dMyIdea(FNOBase):
 - **`Cond`** 取代原来的 `freq_emb=` / `geom_emb=` / `cond=` 三套互不兼容的块签名。`fused()` 按 `[freq, pol, geom]` 拼接，供核条件化块使用。
 - **`core/registry.py`** 是全仓库唯一的"模型名 → 类"映射，模型在自己文件里 `@register` 自注册。**未知名字一律抛错**并列出可选值（不再静默降级）。`build_model(name, cfg)` 是唯一构造入口。
 - 三种条件化方式都能落在同一骨架上：编码器嵌入（`fno_attention`/`fno_film`/`fno_lora`）走 `build_cond`；空间通道广播（`fno_baseline`/`unet`）走 `build_input` 拼常量条件图、`build_cond` 返回 `None`；混合（`fno_v2`）两个钩子都用。
+- **`freq` 的契约是 `(B, 2) = [归一化频率, 极化]`**，由 `data/dataset.py` 定义（每条样本给 `(2,)`，DataLoader 批成 `(B,2)`）。`normalize_freq()` 在 `FNOBase.forward` 入口和 `UNet2d.forward` 里统一补齐：1D 视为单样本、缺极化列补 0，batch 维不匹配则抛 `ValueError`。**新写调用点时按 `(B,2)` 传**，别依赖 1D 兜底；上一版就是因为各模型对 `freq` 的切片宽度不同（宽的靠广播侥幸跑通、窄的如 `fno_v2` 的 `freq[:, 1:2]` 直接 IndexError），同一个坏输入时崩时不崩。
 
 ### 配置的生效顺序
 
