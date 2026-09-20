@@ -80,6 +80,8 @@ LOSS_KEYS = (
     "LOSS_WEIGHT_VECTOR",
     # L1 的 H 组加权
     "FIELD_H_GROUP_WEIGHT",
+    # L8 逐通道加权指数（训练专用；指标固定用 0.0，故不影响 val_rel 口径）
+    "LOSS_CH_WEIGHT_POWER",
     # L2/L7 的 DC/AC 子权重
     "DC_REL_WEIGHT",
     "AC_REL_WEIGHT",

@@ -596,7 +596,11 @@ class Trainer:
         if len(w) > 7 and w[7] != 0.0:
             if loss_space == "physical" and self._denorm_tp is not None:
                 h_boost = float(getattr(C, "FIELD_H_GROUP_WEIGHT", 1.0))
-                loss = loss + w[7] * channel_group_balanced_l2(pred_w, true_w, h_boost=h_boost)
+                # 训练侧启用通道加权（详见 channel_group_balanced_l2 的说明）；
+                # rel_l2_error 指标**不传**该参数，故 val_rel 口径不变
+                loss = loss + w[7] * channel_group_balanced_l2(
+                    pred_w, true_w, h_boost=h_boost,
+                    ch_weight_power=float(getattr(C, "LOSS_CH_WEIGHT_POWER", 0.5)))
             else:
                 loss = loss + w[7] * self.channel_mean_rel_l2_error(pred, true)
 
@@ -637,6 +641,19 @@ class Trainer:
         FIELD_TOTAL_MAG_WEIGHT（默认 2/2/4）。指标要的是一个等权的、可跨实验
         横向比较的几何误差，不应随训练权重漂移——两者不同是刻意的，
         但这也意味着改动 L3 子权重**不会**改变 best.pth 的选择判据。
+
+        ## 已知错配（尚未解决，改权重前先读这里）
+
+        best.pth 由**本函数**选出（`is_best = val_save_rel < ...`），代价是对应的
+        训练项 L3 **只拿到 1.3% 的梯度贡献**（L8 占 97.8%，见 LOSS_CH_WEIGHT_POWER
+        的说明与 models/losses.py::channel_group_balanced_l2）。也就是说：
+        "被选出来的模型"不是"被训练的目标"。
+
+        这不是本函数的问题——它是对的，指标就该与损失解耦。错配来自训练侧
+        权重：L3 的外层权重只有 0.5。调 LOSS_WEIGHT_VECTOR 时须知，把 L3 抬到
+        与 L8 可比（约 ×36）会**同时**放大 L3 内部的 dir/phase/mag 比例失衡
+        （实测 mag 占 82~96%、phase 仅 1~6%，见 FIELD_*_WEIGHT 的说明）。
+        两者要一起改，单独抬权重不解决问题。
         """
         pred_p = self._denorm_output(pred)
         true_p = self._denorm_output(true)

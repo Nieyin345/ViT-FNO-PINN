@@ -232,6 +232,18 @@ def check_metric_independence():
     assert "channel_group_balanced_l2(pred_p, true_p)" in rl, \
         "rel_l2_error 似乎给 channel_group_balanced_l2 传了 h_boost（会漂移）"
 
+    # 指标必须用 ch_weight_power 的**默认值 0.0**。训练侧已改为 0.5
+    # （见 configs/base.py::LOSS_CH_WEIGHT_POWER），若哪天有人把训练侧的
+    # 0.5 也传进指标，val_rel 的刻度就随损失漂移了 —— 而它不报错、只是
+    # 悄悄变成另一个量，正好是本节要防的那种失效。
+    from models.losses import channel_group_balanced_l2 as _cgbl
+    import inspect
+    default_power = inspect.signature(_cgbl).parameters["ch_weight_power"].default
+    assert float(default_power) == 0.0, (
+        f"channel_group_balanced_l2 的 ch_weight_power 默认值被改成了 {default_power}；"
+        f"指标侧靠这个默认值保持旧口径，改了会让 val_rel 与历史 run 不可比"
+    )
+
     return "val_geom / val_rel 与损失配置无关（打乱损失旋钮后逐位不变）"
 
 

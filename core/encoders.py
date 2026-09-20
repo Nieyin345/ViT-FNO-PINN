@@ -71,6 +71,33 @@ class SDFGeomEncoder(nn.Module):
         channels:  使用哪些输入通道（0=SDF, 1=Mask）
         amp_phase: True 用 (幅值, 相位)；False 用 (实部, 虚部)
         hidden:    MLP 隐层宽度
+
+    ## 尺度修正（原实现在此处有缺陷）
+
+    原实现是 `torch.fft.rfft2(field)` + 未归一化的 SDF，导致输出量级失控：
+
+        DC = sum(SDF) = mean(SDF) * H * W
+
+    实测 64×64、SDF∈[-6, 8.7]：DC = 8841（= 2.1585 * 4096），
+    整个 geom_emb 的 |mean| = 386。而同一个条件向量里的 freq_emb 是 0.128、
+    pol_emb 是 0.252 —— **几何比它们大 1500~3000 倍**。
+
+    条件向量是 `Cond.fused()` 拼起来送进同一个 `Linear`（fno_v2 的 film_net）
+    的，量级悬殊意味着几何把频率与极化**淹没**：实测 fused 向量上
+    "只改极化"的位移是 1.28，"换个几何样本"是 2607——后者是前者的 2000 倍。
+    双极化是本项目的标准配置（两个极化是两条独立样本），极化信号被压成这样
+    会直接导致极化间串扰。
+
+    修正分两步，都是**去掉与物理无关的尺度**，不改变表达能力：
+
+        1. 输入逐样本标准化  → 去掉 SDF 的数值单位与整体偏置
+        2. rfft2(norm="ortho") → DC 不再随网格面积 H*W 膨胀
+
+    实测（真实 patch_plane，n_modes=4/channels=(0,)）：386 → 6.0（仅 ortho）
+    → 81.8（仅 std）→ **1.27**（两者都上），与 freq_emb / pol_emb 同量级。
+
+    另注：几何是**形状**信息，其嵌入本就不该随网格分辨率漂移。ortho 归一化
+    顺带保证了这一点（backward 归一化下 64→128 网格会让嵌入整体放大 2 倍）。
     """
 
     def __init__(self, n_modes: int = 4, out_dim: int = 32,
@@ -88,7 +115,15 @@ class SDFGeomEncoder(nn.Module):
 
     def _channel_feat(self, field: torch.Tensor) -> torch.Tensor:
         """field: (B,H,W) -> (B, 2*n_modes²)"""
-        ft = torch.fft.rfft2(field)
+        # 逐样本标准化：去掉 SDF 的数值单位与整体偏置（几何信息在形状里，
+        # 不在"这张 SDF 的数值有多大"里）
+        mu = field.mean(dim=(-2, -1), keepdim=True)
+        sd = field.std(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        field = (field - mu) / sd
+
+        # ortho 归一化：DC 不再等于 sum(field)，从而不随网格面积膨胀，
+        # 也让嵌入对网格分辨率不敏感
+        ft = torch.fft.rfft2(field, norm="ortho")
         low = ft[:, :self.n_modes, :self.n_modes]
         if self.amp_phase:
             first, second = low.abs(), torch.angle(low)

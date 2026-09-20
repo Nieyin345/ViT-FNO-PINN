@@ -120,25 +120,52 @@ def _rel_l2_2d(pred, true, eps=1e-6):
     return (d / n).mean()
 
 
-def channel_group_balanced_l2(pred, true, eps=1e-6, h_boost=1.0):
-    """
-    逐通道相对 L2：E 组(6) 通道内取均值 + H 组(6) 通道内取均值，再平均。
+def channel_group_balanced_l2(pred, true, eps=1e-6, h_boost=1.0, ch_weight_power=0.0):
+    """逐通道相对 L2：E 组(6) 通道内取均值 + H 组(6) 通道内取均值，再平均。
 
     物理空间逐通道相对误差是尺度不变的，天然平衡 Ex(200) / Ey(2300) / Ez(350)
     与 H 组内各通道的差异；E、H 两组再取平均实现跨组平衡。
 
     h_boost>1 时提高 H 组权重：H 组是非主导(弱)分量，易被 FNO 谱偏差淹没，
     提权促使模型精细化拟合 H 组各通道。
+
+    ## ch_weight_power：逐通道等权的隐含后果（训练侧用 0.5，指标侧用 0.0）
+
+    逐通道等权平均**不等于**逐通道同等影响。rel_c = ||Δc|| / ||t_c||，于是
+    损失对第 c 通道的梯度范数 ∝ 1/||t_c|| —— **通道越弱，梯度越大**。
+    实测（散射场、真实数据、当前 12 通道配置）：
+
+        ||t_c|| 从 Ex 的 109062 到 Hz 的 12.2，跨 4 个数量级
+        → Hz_r 单独拿走 43% 的梯度，Hz/Hy 四个通道合计 76%，
+          而 rms 最大的 Ey(1506) 只拿 0.01%、Ex(2700) 拿 0.00%
+
+    也就是说：名义上 L1/L3/L8 的权重是 1.0/0.5/1.0，实际梯度贡献是
+    0.8% / 1.3% / 97.8%。**L8 内部又把 3/4 的预算给了 4 个最弱的场分量**，
+    而 best.pth 的判据 val_geom 对应的 L3 只拿到 1.3%。
+
+    本参数把"组内平均"从等权换成按 ||t_c||^p 加权（权重和为 1）：
+
+        p=0.0 → 与旧行为**逐位相同**（指标的默认值，保证 val_rel 口径不变）
+        p=0.5 → 组内份额跨度从数千倍压到几十倍（训练默认）
+        p=1.0 → 退化成绝对误差等权，Ey 反过来碾压 Hz
+
+    注意它**只影响训练**：`Trainer.rel_l2_error` 不传该参数，故 val_rel
+    仍是旧口径，跨实验可比（由 tools/smoke.py::check_metric_independence 守着）。
     """
-    def _ch_mean(field_p, field_t):
+    def _grp(field_p, field_t):
         B, nch = field_p.shape[:2]
         d = (field_p - field_t).reshape(B, nch, -1).norm(dim=2)
         n = field_t.reshape(B, nch, -1).norm(dim=2).clamp(min=eps)
-        return (d / n).mean()
+        rel = d / n                                   # (B, nch)
+        if not ch_weight_power:
+            return rel.mean()
+        w = n.pow(float(ch_weight_power))
+        w = w / w.sum(dim=1, keepdim=True).clamp_min(eps)
+        return (w * rel).sum(dim=1).mean()
     if pred.shape[1] >= 12:
-        return 0.5 * (_ch_mean(pred[:, :6], true[:, :6])
-                      + h_boost * _ch_mean(pred[:, 6:12], true[:, 6:12]))
-    return _ch_mean(pred, true)
+        return 0.5 * (_grp(pred[:, :6], true[:, :6])
+                      + h_boost * _grp(pred[:, 6:12], true[:, 6:12]))
+    return _grp(pred, true)
 
 
 def lowfreq_fft_loss(pred, true, low_h=4, low_w=4):

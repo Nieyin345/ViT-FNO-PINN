@@ -41,6 +41,33 @@ from core.registry import register
 _F_MIN = 8.0
 _F_MAX = 12.0
 
+# 正弦嵌入用的空间相位：phase = k0 * L，k0 = 2π f / c（真空），L = 单元尺寸。
+#
+# 原实现写死 `phase = (math.pi / 10.0) * f_ghz`。验算后它确实等于 k0*L：
+#     π/10 * f_GHz = 2π * f*1e9 / 2.998e8 * 0.015   （比值恒为 0.9993）
+# 但那个常数把**光速与单位换算都烧进了字面量**，且 L=15mm 是隐含的。
+# 元胞尺寸一变（例如 10mm），正确常数该是 0.2094 而代码仍是 0.3142，
+# **静默失配**——正弦通道携带的就不再是物理波数了。
+#
+# 现在从物理量算：光速改为精确值 2.99792458e8（原 2.998e8 让比值停在
+# 0.9993，改用精确值后与 π/10 的差别是 0.07%，数值上几乎等价）。
+_C_LIGHT = 2.99792458e8          # m/s
+_CELL_MM_DEFAULT = 15.0          # 元胞/单元尺寸，(与 CLAUDE.md 记录的 cell_mm=15 一致)
+
+
+def _sine_phase(freq_norm: torch.Tensor, cell_mm: float) -> torch.Tensor:
+    """归一化频率 (B,1) → 空间相位 k0*L，单位 rad。
+
+    Args:
+        freq_norm: (B,1) 归一化频率（0 → _F_MIN，1 → _F_MAX）
+        cell_mm:   单元尺寸（mm）
+
+    Returns:
+        (B,1) 相位，量级 ~2.5（8GHz）~3.8（12GHz）
+    """
+    f_hz = (_F_MIN + (_F_MAX - _F_MIN) * freq_norm) * 1e9
+    return 2.0 * math.pi * f_hz * (cell_mm * 1e-3) / _C_LIGHT
+
 
 class SpectralConv2dV2(nn.Module):
     """标准 FNO 频域卷积 + 可选的核条件化。
@@ -124,7 +151,20 @@ class SpectralConv2dV2(nn.Module):
             fp = self.film_net(c)  # (B, 2*out)
             scale = fp[:, :self.out_channels].view(B, self.out_channels, 1, 1)
             shift = fp[:, self.out_channels:].view(B, self.out_channels, 1, 1)
-            out_ft = out_ft * (1.0 + scale).to(out_ft.dtype) + shift.to(out_ft.dtype)
+            # 只对**非 DC** 频点做 scale/shift。
+            #
+            # 原来是对整个 out_ft 做 `out_ft * (1+scale) + shift`，但 out_ft 的
+            # [:, :, 0, 0] 是 DC 分量，给它加常数在空域等于叠加一个原点处的
+            # 空间冲激（delta），而不是"平移特征图"——语义与 FiLM 的名字不符，
+            # 且会污染通道的直流分量（预测场是非零均值场，DC 有物理含义）。
+            #
+            # 这里保持零初始化时**恒等**：scale=shift=0 → 乘 (1+0) 加 0，
+            # 与原来完全一致（起点行为不变，不破坏训练早期的稳定性）。
+            non_dc = out_ft[:, :, 1:, :]
+            out_ft = torch.cat([
+                out_ft[:, :, :1, :],
+                non_dc * (1.0 + scale).to(out_ft.dtype) + shift.to(out_ft.dtype),
+            ], dim=2)
 
         return torch.fft.irfft2(out_ft, s=(H, W)).to(x.dtype)
 
@@ -151,6 +191,9 @@ class FNO2dV2(FNOBase):
         super().__init__(cfg)
         self.use_sine_input = cfg.use_sine_input
         self.use_pol_cond = cfg.use_pol_cond
+        # 正弦嵌入用的单元尺寸（mm）。走 cfg.extra 扩展口，不占 ModelConfig 字段；
+        # 换元胞尺寸时在实验条目里写 MODEL_EXTRA={"CELL_MM": 10.0} 即可。
+        self.cell_mm = float(cfg.extra.get("CELL_MM", _CELL_MM_DEFAULT))
         # 正弦嵌入通道数：x/y 各 sin/cos = 4
         self.n_sine = 4 if cfg.use_sine_input else 0
 
@@ -178,13 +221,17 @@ class FNO2dV2(FNOBase):
         )
 
     def _sine_embedding(self, x, freq):
-        """频率相关的空间正弦嵌入：sin/cos(k·x/y)，k 由工作频率决定。"""
+        """频率相关的空间正弦嵌入：sin/cos(k0·L·x/y)，k0 由工作频率决定。
+
+        相位取物理量 k0*L（L=单元尺寸），见 `_sine_phase`。
+        空间坐标归一化到 [-1,1]，因此这里的"相位跨度"是 2*k0*L，
+        即网格跨越约 0.8（8GHz）~1.2（12GHz）个周期——这组通道提供的是
+        **全局低频调制**（频率线索），不是精细空间结构，与设计意图一致。
+        """
         B, _, H, W = x.shape
-        f_ghz = _F_MIN + (_F_MAX - _F_MIN) * freq[:, 0:1]          # (B,1) 8~12 GHz
-        phase = (math.pi / 10.0) * f_ghz                           # (B,1) rad
+        p = _sine_phase(freq[:, 0:1], self.cell_mm).view(B, 1, 1)   # (B,1,1)
         y_n = torch.linspace(-1.0, 1.0, H, device=x.device).view(1, H, 1).expand(1, H, W)
         x_n = torch.linspace(-1.0, 1.0, W, device=x.device).view(1, 1, W).expand(1, H, W)
-        p = phase.view(B, 1, 1)
         return torch.stack([
             torch.sin(p * x_n), torch.cos(p * x_n),
             torch.sin(p * y_n), torch.cos(p * y_n),
