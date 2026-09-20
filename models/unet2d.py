@@ -67,6 +67,7 @@ class UNet2d(nn.Module):
         self.up1 = nn.ConvTranspose2d(ch[1], ch[0], 2, stride=2)
         self.dec1 = ConvBlock(ch[0] * 2, ch[0])
 
+        self.dropout = nn.Dropout2d(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         self.out_conv = nn.Conv2d(ch[0], cfg.out_channels, 1)
 
     def _broadcast_condition(self, x, freq):
@@ -99,7 +100,7 @@ class UNet2d(nn.Module):
         d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
 
-        out = self.out_conv(d1)
+        out = self.out_conv(self.dropout(d1))
         if out.shape[-2:] != (H, W):
             out = F.interpolate(out, size=(H, W), mode="bilinear", align_corners=False)
         return out

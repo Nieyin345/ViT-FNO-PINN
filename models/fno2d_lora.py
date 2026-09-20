@@ -150,6 +150,7 @@ class FNO2dLoRA(FNOBase):
             for _ in range(cfg.n_layers)
         ])
 
+        self.dropout = nn.Dropout2d(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         self.proj = nn.Sequential(
             nn.Conv2d(cfg.width, 64, kernel_size=1),
             nn.GELU(),
@@ -163,4 +164,4 @@ class FNO2dLoRA(FNOBase):
         return Cond(freq_emb=self.freq_encoder(freq), geom_emb=self.geom_encoder(x))
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
+        return self.proj(self.dropout(x))

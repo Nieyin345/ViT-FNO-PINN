@@ -19,6 +19,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 模型学的是**散射场**（总场 − 无贴片背景场），不是总场。传播只对散射场做功，传完再加回背景场，避免驻波被重复传播。见 `field2field/README.md`。
 - 输出 12 通道 = `[Ex_r, Ex_i, Ey_r, Ey_i, Ez_r, Ez_i, Hx_r, Hx_i, Hy_r, Hy_i, Hz_r, Hz_i]`，实虚部成对。
 - 频率 8~12 GHz 共 9 点；Floquet 端口垂直入射 + 周期边界。
+- **极化 2 的背景场 = 极化 1 背景场的旋转变换，且 E 组要取负号、H 组不取**：
+
+  ```
+  pol2.Ex = -pol1.Ey     pol2.Hx = +pol1.Hy
+  pol2.Ey = -pol1.Ex     pol2.Hy = +pol1.Hx
+  ```
+
+  **两处实现必须同步**：`data/fit_background.py::_orthogonal_polarization_field`（训练路径）
+  与 `field2field/propagate_fno_prediction.py::_rotate_plane`（推理/传播路径）。
+  原先两处都是**纯交换、E 少了负号**，后果是极化 2 的散射场里混进约两倍幅值的入射波
+  （实测 pol2/pol1 散射场能量比中位 1.477、均值 22.7、最大 813.9，而正确应为 1.000），
+  影响 `DATASET_POLARIZATIONS=[0,1]` 下约 1/3 的训练记录，且终端无任何异常提示。
+  符号来自复最小二乘实测（115 个双极化样本 × 3 频点）：
+
+  | 关系 | 系数 c | 相位 |
+  |---|---|---|
+  | `pol2.Ex = c·pol1.Ey` | −0.9567 | 179.9° |
+  | `pol2.Ey = c·pol1.Ex` | −0.8921 | 179.8° |
+  | `pol2.Hx = c·pol1.Hy` | +0.9473 | −0.0° |
+  | `pol2.Hy = c·pol1.Hx` | +0.9821 | −0.1° |
+
+  **别凭直觉推翻它**：E 与 H 的符号相反（一个取负、一个不取），且 E 的两个通道都取负。
+  曾据"合并通道的相关"误判为"整体取负、H 也要负"，直到逐通道复最小二乘才定下来——
+  合并相关由幅值占绝对优势的 E（`Ey`~2900 vs `Hx`~6）主导，分辨不出 H。
 
 ## 目录结构
 
@@ -371,6 +395,24 @@ L3 的外层权重抬上去只会放大这个失衡，不解决问题。
 （上面那批"建了却不调用"的修正**会**改变 key/shape，所以指纹能看见——`vit` /
 `deeponet` 少了 `lift.*`、`vit` 少了 `cls_token`。这些模型此前的 checkpoint 一律
 `STALE`。）
+
+### 输出头 dropout 必须在所有模型上一致（`PROJ_DROPOUT`）
+
+`configs/base.py` 的 `PROJ_DROPOUT`（默认 0.05）**只对"输出头"生效**，且历史上
+只有 5 个模型真正读了 `cfg.dropout`（`fno_v2`/`afno`/`vit`/`cnn`/`mlp`），另 6 个
+建了头却从不使用 → 主模型 `fno_attention` **完全没有正则**，而它的对比对象有。
+后果是消融表里混进了"有无 dropout"这个额外变量（实测 train 模式两次前向：主模型
+差 0.0000、`fno_v2` 差 1.19）。现在 11 个模型全部接入：在**输出头之前**加
+`Dropout2d(cfg.dropout)`（`deeponet` 无独立输出头，dropout 作用在 branch 系数上）。
+`dropout=0` 时退化为 `nn.Identity()`，不改变任何 key/shape。
+
+**新模型必须接上**：不接就是"消融对照里混进额外变量"那一类（见上一节）。核对方法
+是 `m.train()` 下连续两次 `forward` 的最大差应显著非零，`m.eval()` 下必须**恰好为 0**。
+
+**注意这是架构指纹的盲区**：`Dropout` 无参数，加/去它**不改变 `state_dict` 的
+(key, shape)**，所以 `arch_fingerprint` 和 `tools/report.py` 都看不见——实测
+`dropout=0` 与 `0.05` 的指纹完全相同。与上面 FiLM 换域是同一类问题，改它请自行判断
+是否需要重跑。
 
 
 ### 数据格式

@@ -99,6 +99,9 @@ class DeepONet2d(FNOBase):
 
         self.branch = BranchNet(cfg.in_channels, cond_dim, cfg.width, self.p, cfg.out_channels)
         self.trunk = TrunkNet(self.p)
+        # 输出前的 dropout：作用在 branch 系数上（本模型没有独立输出头，
+        # 乘积求和就是输出映射）。与其他模型"输出前 dropout"的口径一致。
+        self.dropout = nn.Dropout(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         # 基座骨架（lift→pad→blocks→crop→head）在本模型里完全用不上：输出是
         # branch·trunk 的乘积求和，没有"逐层堆块"这一步。故 blocks 留空，
         # 不去注册会重复出现在 state_dict 里的别名。
@@ -135,7 +138,7 @@ class DeepONet2d(FNOBase):
         B, _, H, W = x.shape
 
         cond = self.freq_encoder(freq) if freq is not None else None
-        coeff = self.branch(x, cond)                          # (B, C_out, p)
+        coeff = self.dropout(self.branch(x, cond))            # (B, C_out, p)
         basis = self.trunk(self._coords(H, W, x.device, x.dtype)) + self.trunk_bias
         # (B, C_out, p) @ (p, H·W) → (B, C_out, H·W)
         out = torch.einsum("bcp,np->bcn", coeff, basis).reshape(B, self.cfg.out_channels, H, W)

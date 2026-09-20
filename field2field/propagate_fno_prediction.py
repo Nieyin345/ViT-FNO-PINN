@@ -85,9 +85,14 @@ def _wavelength_mm(freq_ghz):
 
 
 def _rotate_plane(plane):
-    """把单极化背景场旋转为正交极化：Ex/Ey 互换，Hx/Hy 互换。"""
+    """把单极化背景场旋转为正交极化：Ex/Ey 互换、Hx/Hy 互换。
+
+    **E 组额外取负号、H 组不取**，与 `data/fit_background.py::_orthogonal_polarization_field`
+    保持完全一致（两处必须同步，否则训练与传播的极化口径不同）。
+    符号来源见该函数 docstring 的实测数据。
+    """
     out = plane.copy()
-    out[..., [0, 1, 2, 3]] = plane[..., [2, 3, 0, 1]]
+    out[..., [0, 1, 2, 3]] = -plane[..., [2, 3, 0, 1]]
     out[..., [6, 7, 8, 9]] = plane[..., [8, 9, 6, 7]]
     return out
 

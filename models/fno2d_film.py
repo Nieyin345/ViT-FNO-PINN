@@ -114,6 +114,7 @@ class FNO2dFiLM(FNOBase):
 
         self.freq_encoder = FourierFreqEncoder(n_freqs=16, out_dim=cfg.freq_dim)
         self.geom_encoder = SDFGeomEncoder(n_modes=4, out_dim=cfg.freq_dim)
+        self.dropout = nn.Dropout2d(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         self.shared_proj = nn.Sequential(
             nn.Conv2d(cfg.width, 64, kernel_size=1), nn.GELU()
         )
@@ -128,5 +129,5 @@ class FNO2dFiLM(FNOBase):
         return Cond(freq_emb=self.freq_encoder(freq), geom_emb=self.geom_encoder(x))
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:
-        shared = self.shared_proj(x)
+        shared = self.dropout(self.shared_proj(x))
         return torch.cat([h(shared) for h in self.heads], dim=1)

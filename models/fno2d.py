@@ -52,6 +52,10 @@ class FNO2d(FNOBase):
         self.freq_encoder = FourierFreqEncoder(n_freqs=16, out_dim=cfg.freq_dim)
         self.geom_encoder = SDFGeomEncoder(n_modes=4, out_dim=cfg.freq_dim)
 
+        # dropout 与其余模型（fno_v2/afno/vit/cnn/mlp 都读 cfg.dropout）对齐：
+        # 主模型原先**完全没有正则**，而它的对比对象有，消融里混进了"有无 dropout"
+        # 这个额外变量（实测 train 模式两次前向：主模型差 0.0000，fno_v2 差 1.19）。
+        self.dropout = nn.Dropout2d(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         self.shared_proj = nn.Sequential(
             nn.Conv2d(cfg.width, 64, kernel_size=1),
             nn.GELU(),
@@ -77,7 +81,7 @@ class FNO2d(FNOBase):
         return Cond(freq_emb=self.freq_encoder(freq), geom_emb=self.geom_encoder(x))
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:
-        shared = self.shared_proj(x)
+        shared = self.dropout(self.shared_proj(x))
         if self.use_em_heads:
             e_pred = torch.cat([h(shared) for h in self.e_heads], dim=1)
             h_input = torch.cat([shared, e_pred], dim=1)

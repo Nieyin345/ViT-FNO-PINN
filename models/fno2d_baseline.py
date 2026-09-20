@@ -79,6 +79,7 @@ class FNO2dBaseline(FNOBase):
             FNOBlockVanilla(cfg.width, cfg.modes1, cfg.modes2) for _ in range(cfg.n_layers)
         ])
 
+        self.dropout = nn.Dropout2d(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         self.proj = nn.Sequential(
             nn.Conv2d(cfg.width, 64, kernel_size=1),
             nn.GELU(),
@@ -107,4 +108,4 @@ class FNO2dBaseline(FNOBase):
         return torch.cat([x, self._broadcast_condition(x, freq)], dim=1)
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
+        return self.proj(self.dropout(x))
