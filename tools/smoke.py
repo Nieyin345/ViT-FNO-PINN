@@ -298,6 +298,59 @@ def check_arch_fingerprint():
     return "同配置稳定 / 改配置变化 / 可从存档重算 / 未知模型抛错"
 
 
+def check_recipe_consistency():
+    """基线代次配方必须与当前生效的损失配置**逐键相同**。
+
+    用户定的流程是「先固定一版合理的损失，全部模型集体跑一次得到基线；之后只
+    迭代主模型，等主模型提升后再把新损失同步给全部模型跑一次」。这条流程最怕
+    的是**单侧漂移**：改了 `LOSS_WEIGHT_VECTOR`（或 `LOSS_CH_WEIGHT_POWER`）
+    却只重跑了几个模型，于是"基线的分数"和"主模型的分数"根本不是同一套损失
+    算出来的，而终端上完全看不出来——两边都只是"跑完了"。
+
+    `tools/train.py` 启动时也调同一个 `check_recipe()` 并直接报错，这一项是把它
+    钉在冒烟测试里：**改损失而忘了升代次**，本地自检就会拦下来。
+
+    覆盖两个方向：
+      - 配方漏掉了某个 `LOSS_KEYS` 里的键 → 该键改了无人监管（静默）；
+      - 故意改一个键 → 必须被检出（否则守卫等于没写）。
+    """
+    from configs import base as C
+    from configs.experiments import check_recipe, RECIPES, ACTIVE_RECIPE
+    from configs.scenario import LOSS_KEYS
+
+    # 1. 配方必须覆盖全部损失键。漏一个 = 改它不会被任何东西发现。
+    expected = RECIPES[ACTIVE_RECIPE]
+    missing = [k for k in LOSS_KEYS if k not in expected]
+    assert not missing, (
+        f"基线代次 {ACTIVE_RECIPE!r} 的配方没有覆盖这些损失键: {missing}；"
+        f"它们改了不会被 check_recipe 发现，等于游离在代次之外"
+    )
+
+    # 2. 当前配置必须与该代次逐键相同（这是 train.py 启动时的同一条判据）
+    r = check_recipe(C)
+    assert r["drift"] == [], (
+        f"当前损失配置与基线代次 {r['name']!r} 不一致（{len(r['drift'])} 处）:\n"
+        + "\n".join(f"    {k}: 配方={e!r}  当前={a!r}" for k, e, a in r["drift"])
+        + "\n    若是**有意**换了一版损失，请同时改 configs/experiments.py 的 GEN1 与 "
+          "GEN1_NAME 升代次，并把全部模型重跑一遍；否则新旧分数同表不可比。"
+    )
+
+    # 3. 负向测试：改一个键，守卫必须报错
+    probe = "LOSS_CH_WEIGHT_POWER"
+    saved = getattr(C, probe)
+    try:
+        setattr(C, probe, 1.0 if float(saved) != 1.0 else 0.0)
+        drift_keys = [k for k, _, _ in check_recipe(C)["drift"]]
+        assert probe in drift_keys, (
+            f"把 {probe} 改成 1.0 之外的另一个值却没被 check_recipe 检出——守卫失效"
+        )
+    finally:
+        setattr(C, probe, saved)
+
+    return (f"代次 {r['name']!r} 覆盖全部 {len(LOSS_KEYS)} 个损失键、"
+            f"当前配置逐键一致、改键能被检出")
+
+
 def check_scenario_partition():
     """场景/损失两桶必须不重叠，且覆盖 base.py 里所有大写配置项。
 
@@ -394,6 +447,9 @@ def main():
 
     print("\n[9] 架构指纹（判断旧结果是否过期）")
     check("改模型类才变，重训/换损失不变", check_arch_fingerprint)
+
+    print("\n[10] 基线代次配方")
+    check("损失配置与当前基线代次一致", check_recipe_consistency)
 
     print("\n" + "=" * 68)
     if FAILS:

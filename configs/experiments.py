@@ -226,3 +226,95 @@ EXPERIMENTS = {
         "MODEL_EXTRA": {"deeponet_basis": 128},
     },
 }
+
+
+# =============================================================================
+# 基线代次配方（GEN1）：让"这一代基线用哪套损失"可被机器校验
+# =============================================================================
+"""基线代次配方。
+
+动机：用户定的流程是「先固定一版合理的损失，**全部模型集体跑一次**得到基线；
+之后只迭代主模型，等主模型提升后再把新损失同步给全部模型跑一次」。这条流程
+最怕的是**单侧漂移**：
+
+  - 改了 LOSS_WEIGHT_VECTOR 却只重跑了几个模型 → 基线与主模型不再同代，
+    对比出来的"提升"可能只是权重不同，而终端上完全看不出来；
+  - 反过来，有人改回旧值再跑 → 新老 run 混在一张表里。
+
+`tools/train.py` 在启动时调 `check_recipe()`：只要当前生效的 `LOSS_KEYS`
+与下面这组值对不上就**直接报错**，除非显式传 `--allow-recipe-drift`。
+
+**升代次怎么做**（就三步）：
+  1. 把下面 `GEN1` 的值改成新的一代；`GEN1_NAME` 同步改（如 "gen2"）；
+  2. 全部模型重跑一次；
+  3. `python -m tools.report` 会按场景/损失指纹把两代分成两张表，
+     跨代不会混在一起。
+
+注意：`LOSS_CH_WEIGHT_POWER` 在 `LOSS_KEYS` 里，所以它也算"食谱的一部分"，
+改了同样要求重跑——这是有意的，它确实改变训练目标。
+"""
+
+GEN1_NAME = "gen1"
+
+# 与 configs/base.py 的默认值**逐字相同**，此处显式写出来是为了让它成为一个
+# 可校验的契约，而不是"碰巧等于默认值"。改损失请改这里并升代次。
+GEN1 = {
+    "LOSS_SPACE": "physical",
+    "USE_LOSS_CURRICULUM": False,
+    "DETAIL_LOSS_START_EPOCH": 40,
+    "DETAIL_LOSS_RAMP_EPOCHS": 200,
+    "LOSS_ENABLE_VECTOR": [1, 0, 1, 0, 0, 0, 0, 1, 0],
+    "LOSS_WEIGHT_VECTOR": [1.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    "LOSS_CH_WEIGHT_POWER": 0.5,
+    "FIELD_H_GROUP_WEIGHT": 1.5,
+    "DC_REL_WEIGHT": 1.0,
+    "AC_REL_WEIGHT": 1.0,
+    "FIELD_DIR_ANGLE_WEIGHT": 2.0,
+    "FIELD_COMPLEX_PHASE_WEIGHT": 2.0,
+    "FIELD_TOTAL_MAG_WEIGHT": 4,
+    "AUX_COMPLEX_CH_DC_WEIGHT": 1.0,
+    "AUX_COMPLEX_CH_AC_WEIGHT": 1.0,
+    "AUX_COMPLEX_CH_NORMALIZE_BY_TOTAL": True,
+    "AUX_COMPLEX_CH_DC_DENOM_FLOOR_RATIO": 0.1,
+    "AUX_COMPLEX_CH_LOG_COMPRESS": True,
+    # L5/L6 频域子权重。本代 L5/L6 都没启用（见 LOSS_ENABLE_VECTOR 的下标 4/5），
+    # 所以这两个值在当前是**惰性**的——但照样记进来：否则哪天有人单独改它们、
+    # 又碰巧启用了 L5/L6，那就成了不受 check_recipe 监管的改动。
+    "LOWFREQ_PATCH": 4,
+    "HIGHFREQ_CUTOFF": 6,
+}
+
+# 当前应当生效的配方（切代次就改这一行）
+ACTIVE_RECIPE = GEN1_NAME
+RECIPES = {GEN1_NAME: GEN1}
+
+
+def check_recipe(base_module=None) -> dict:
+    """校验当前生效的损失配置属于哪一代；不属于任何一代则抛错。
+
+    Returns:
+        {"name": 代次名, "drift": [(键, 期望值, 实际值), ...]}
+        `drift` 为空表示完全吻合。
+    """
+    from configs.scenario import LOSS_KEYS
+
+    if base_module is None:
+        from configs import base as base_module
+
+    expected = RECIPES[ACTIVE_RECIPE]
+    drift = []
+    for k in LOSS_KEYS:
+        exp = expected.get(k)
+        act = getattr(base_module, k, None)
+        if exp is None:
+            continue
+        # 列表逐元素比，避免 == 对 list 的坑（这里其实安全，但保持一致）
+        if isinstance(exp, list):
+            same = (isinstance(act, list) and len(act) == len(exp)
+                    and all(a == b for a, b in zip(act, exp)))
+        else:
+            same = (act == exp)
+        if not same:
+            drift.append((k, exp, act))
+    return {"name": ACTIVE_RECIPE, "drift": drift}
+

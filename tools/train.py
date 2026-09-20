@@ -93,6 +93,9 @@ def parse_args(argv=None):
     g.add_argument("--seed", type=int, default=None, help="随机种子（默认用配置里的）")
     g.add_argument("--device", default=None, help="cuda / cpu（默认自动判断）")
     g.add_argument("--loss-space", default=None, choices=["physical", "normalized"])
+    # 明知与基线代次配方不一致仍要跑时用（结果不可与基线同表比较）
+    g.add_argument("--allow-recipe-drift", action="store_true",
+                   help="跳过基线代次配方校验（试损失用；结果不可与基线比较）")
 
     g = p.add_argument_group("输出")
     g.add_argument("--tag", default=None,
@@ -890,6 +893,24 @@ def main(argv=None):
         return 0
 
     apply_cli_overrides(args)
+
+    # 基线代次配方校验：防止"改了损失却只重跑一部分模型"（见 configs/experiments.py）
+    from configs.experiments import check_recipe
+    recipe = check_recipe(C)
+    if recipe["drift"]:
+        lines = [f"    {k}: 配方={exp!r}  当前={act!r}" for k, exp, act in recipe["drift"]]
+        msg = (f"损失配方与基线代次 {recipe['name']!r} 不一致（{len(recipe['drift'])} 处）：\n"
+               + "\n".join(lines))
+        if not getattr(args, "allow_recipe_drift", False):
+            raise SystemExit(
+                f"\n[基线配方不符] {msg}\n\n"
+                f"这会让本次 run 与同代基线**不可比**。两种正确做法：\n"
+                f"  1) 若这是有意升代次：改 configs/experiments.py 的 GEN* 与 ACTIVE_RECIPE，"
+                f"然后**全部模型**重跑一次；\n"
+                f"  2) 若只想试一下就加 --allow-recipe-drift（结果会标成独立代次，别和基线比）。\n")
+        print(f"[警告] {msg}\n[警告] 已用 --allow-recipe-drift 放行，本次结果不可与基线同表比较。")
+    else:
+        print(f"[配方] 与基线代次 {recipe['name']!r} 一致")
 
     print(f"[配置] 实验={getattr(C, 'ACTIVE_EXPERIMENT', '-')}  "
           f"模型={C.model_name_from_globals()}  "
