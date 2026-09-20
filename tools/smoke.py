@@ -171,6 +171,170 @@ def check_strict_loading_rejects_mismatch(tmpdir):
     return "; ".join(ok)
 
 
+def check_metric_independence():
+    """**"损失可以随便改而结果仍可比"这条不变式的守卫。**
+
+    保存/早停指标 val_geom / val_rel 必须**不读任何损失配置**，否则换一版损失后
+    新旧数字就没有共同刻度，整个"基线冻结 + 主模型迭代损失"的流程不成立。
+
+    实现上靠的是：Trainer.geom_metric 调用 field_geom_loss_eh(pred, true) 用子权重
+    默认值 1/1/1，Trainer.rel_l2_error 调用 channel_group_balanced_l2(pred, true) 用
+    h_boost 默认 1.0 —— 都不透传 config 里的训练侧旋钮。
+
+    历史上 val_geom 一直是干净的，但这条性质**没有任何东西守着**：
+    只要有人顺手把 FIELD_H_GROUP_WEIGHT 传进 geom_metric，指标就随损失漂移，
+    而终端上完全看不出来。所以这里把它钉死。
+    """
+    import torch
+    from configs import base as C
+    from models.losses import field_geom_loss_eh, channel_group_balanced_l2
+
+    g = torch.Generator().manual_seed(0)
+    p = torch.randn(2, 12, 16, 16, generator=g)
+    t = torch.randn(2, 12, 16, 16, generator=g)
+
+    base_geom = field_geom_loss_eh(p, t).item()
+    base_rel = channel_group_balanced_l2(p, t).item()
+
+    # 把损失侧旋钮全部打到极端值
+    saved = {k: getattr(C, k, None) for k in (
+        "FIELD_H_GROUP_WEIGHT", "FIELD_DIR_ANGLE_WEIGHT",
+        "FIELD_COMPLEX_PHASE_WEIGHT", "FIELD_TOTAL_MAG_WEIGHT",
+        "LOSS_WEIGHT_VECTOR", "LOSS_ENABLE_VECTOR")}
+    try:
+        C.FIELD_H_GROUP_WEIGHT = 99.0
+        C.FIELD_DIR_ANGLE_WEIGHT = 0.001
+        C.FIELD_COMPLEX_PHASE_WEIGHT = 77.0
+        C.FIELD_TOTAL_MAG_WEIGHT = 0.5
+        C.LOSS_WEIGHT_VECTOR = [9.0] * 9
+
+        after_geom = field_geom_loss_eh(p, t).item()
+        after_rel = channel_group_balanced_l2(p, t).item()
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                setattr(C, k, v)
+
+    assert abs(base_geom - after_geom) < 1e-9, (
+        f"val_geom 随损失配置变化了（{base_geom} -> {after_geom}）——"
+        f"指标不再与损失无关，换一版损失后新旧结果不可比"
+    )
+    assert abs(base_rel - after_rel) < 1e-9, (
+        f"val_rel 随损失配置变化了（{base_rel} -> {after_rel}）"
+    )
+
+    # 静态确认调用点没有把 config 值传进去
+    src = open(os.path.join(_ROOT, "tools", "train.py"), encoding="utf-8").read()
+    gm = src.split("def geom_metric")[1].split("\n    def ")[0]
+    rl = src.split("def rel_l2_error")[1].split("\n    def ")[0]
+    assert "field_geom_loss_eh(pred_p, true_p)" in gm, \
+        "geom_metric 似乎给 field_geom_loss_eh 传了额外参数（子权重会漂移）"
+    assert "channel_group_balanced_l2(pred_p, true_p)" in rl, \
+        "rel_l2_error 似乎给 channel_group_balanced_l2 传了 h_boost（会漂移）"
+
+    return "val_geom / val_rel 与损失配置无关（打乱损失旋钮后逐位不变）"
+
+
+def check_arch_fingerprint():
+    """架构指纹必须是"改模型类才变、重训/换损失不变"。
+
+    整个"基线冻结 + 主模型迭代损失"的流程都挂在这条上：
+    指纹不变 → 旧 checkpoint 还加载得进去 → 旧结果仍然有效，不必重跑。
+
+    它误报成"变了"的代价是白白重跑一代；误报成"没变"的代价是拿两个
+    不可比的数字当可比——所以要两个方向都钉住。
+    """
+    from configs import base as C
+    from configs import scenario as SC
+    from core.config import ModelConfig
+    from core.registry import build_model
+
+    cfg = ModelConfig(width=32, n_layers=2, modes1=8, modes2=8)
+    fp1 = SC.arch_fingerprint(build_model("fno_v2", cfg))
+    fp2 = SC.arch_fingerprint(build_model("fno_v2", cfg))
+    assert fp1 == fp2, "同一配置两次构造的指纹不同（权重随机初始化泄漏进指纹了？）"
+
+    # 不同配置 → 不同指纹
+    cfg_wide = ModelConfig(width=48, n_layers=2, modes1=8, modes2=8)
+    assert SC.arch_fingerprint(build_model("fno_v2", cfg_wide)) != fp1, \
+        "改了 width 指纹没变"
+    cfg_deep = ModelConfig(width=32, n_layers=3, modes1=8, modes2=8)
+    assert SC.arch_fingerprint(build_model("fno_v2", cfg_deep)) != fp1, \
+        "改了层数指纹没变"
+
+    # 从存档的 (model_name, model_config) 重算，应与训练时记的一致
+    assert SC.arch_fingerprint_from_cfg("fno_v2", cfg.to_dict()) == fp1, \
+        "从 model_config 重算的指纹与训练时不符——report 会误判全部 run 过期"
+
+    # 模型已被删掉时必须抛错（report 据此标为已失效，而不是崩掉）
+    try:
+        SC.arch_fingerprint_from_cfg("fno_does_not_exist", cfg.to_dict())
+    except Exception:
+        pass
+    else:
+        raise AssertionError("未知模型名没有抛错——report 无法识别失效的 run")
+
+    # 训练侧必须真的把它写进 summary / checkpoint
+    src = open(os.path.join(_ROOT, "tools", "train.py"), encoding="utf-8").read()
+    def body(fn):
+        return src.split(f"def {fn}")[1].split("\n    def ")[0]
+    assert "arch_fingerprint" in body("write_summary"), \
+        "summary.json 没写 arch_fingerprint —— report 无法判断结果是否过期"
+    assert "arch_fingerprint" in body("_save"), \
+        "checkpoint 没写 arch_fingerprint"
+
+    return "同配置稳定 / 改配置变化 / 可从存档重算 / 未知模型抛错"
+
+
+def check_scenario_partition():
+    """场景/损失两桶必须不重叠，且覆盖 base.py 里所有大写配置项。
+
+    漏掉一个键 = 它既不进场景指纹也不进损失食谱，改了它不会有任何记录。
+    """
+    from configs import base as C
+    from configs import scenario as SC
+
+    s, l = set(SC.SCENARIO_KEYS), set(SC.LOSS_KEYS)
+    overlap = s & l
+    assert not overlap, f"场景与损失两桶重叠: {sorted(overlap)}"
+
+    # 模型结构键两桶都不进（由 ModelConfig 记录），其余必须被覆盖
+    model_keys = {
+        "MODEL_NAME", "model", "SAVE_DIR", "MODES1", "MODES2", "WIDTH", "N_LAYERS",
+        "FREQ_DIM", "PADDING", "COND_CHANNELS", "OUT_CHANNELS", "HEAD_MODE",
+        "MODEL_EXTRA", "PROJ_DROPOUT", "SPECTRAL_DECAY", "SPECTRAL_DECAY_K0",
+        "SPECTRAL_DECAY_ORDER", "SPECTRAL_ATTENTION_ENABLE",
+        "SPECTRAL_FREQ_CONDITIONING", "SPECTRAL_GEOM_CONDITIONING",
+        "SPECTRAL_GAMMA_INIT", "SPECTRAL_GAMMA_FIXED", "ACTIVE_EXPERIMENT",
+        "KERNEL_COND_MODE", "USE_SINE_INPUT", "USE_POL_COND", "LORA_RANK",
+        "SAVE_LATEST_EVERY", "ONLY_SAVE_PTH", "VAL_EVERY", "NUM_WORKERS",
+        "PIN_MEMORY", "USE_SINGLE_OUTPUT_HEAD", "IN_CHANNELS",
+    }
+    allkeys = {k for k in vars(C) if k.isupper() and not k.startswith("_")}
+    missing = allkeys - s - l - model_keys
+    assert not missing, (
+        f"这些配置项既不在 SCENARIO_KEYS 也不在 LOSS_KEYS，改了不会有记录: "
+        f"{sorted(missing)}"
+    )
+
+    # 指纹必须真的随场景变化
+    snap = SC.snapshot(SC.SCENARIO_KEYS)
+    f1 = SC.fingerprint(snap)
+    snap2 = dict(snap)
+    snap2["OUTPUT_NORM_MODE"] = "zscore"
+    assert SC.fingerprint(snap2) != f1, "改 OUTPUT_NORM_MODE 指纹没变"
+
+    # 划分指纹：同样的索引必须得到同样的哈希，不同索引必须不同
+    a = SC.split_fingerprint([1, 2, 3], [4, 5])
+    b = SC.split_fingerprint([3, 2, 1], [5, 4])   # 顺序无关
+    c = SC.split_fingerprint([1, 2, 3], [4, 6])
+    assert a == b, "划分指纹对索引顺序敏感（应当无关）"
+    assert a != c, "划分变了指纹没变"
+
+    return (f"两桶不重叠、覆盖全部配置项；场景指纹随配置变化；"
+            f"划分指纹顺序无关且能检出增删")
+
+
 def check_experiments_resolve():
     from configs import base as C
     from configs.experiments import EXPERIMENTS
@@ -209,6 +373,15 @@ def main():
 
     print("\n[6] 预设实验")
     check("experiments 全部可解析", check_experiments_resolve)
+
+    print("\n[7] 指标与损失解耦（'损失可迭代、结果仍可比'的守卫）")
+    check("val_geom / val_rel 不随损失配置变化", check_metric_independence)
+
+    print("\n[8] 场景 / 损失 划分")
+    check("两桶不重叠且覆盖全部配置项", check_scenario_partition)
+
+    print("\n[9] 架构指纹（判断旧结果是否过期）")
+    check("改模型类才变，重训/换损失不变", check_arch_fingerprint)
 
     print("\n" + "=" * 68)
     if FAILS:

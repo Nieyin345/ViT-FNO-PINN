@@ -49,6 +49,7 @@ from core import checkpoint as CK
 from core.config import ModelConfig
 from core.registry import available as available_models, build_model
 from configs import base as C
+from configs import scenario as SC
 from data.dataset import EMMultiFreqDataset
 from models.losses import (
     field_rel_l2_loss, field_geom_loss, field_geom_loss_eh, freq_band_loss,
@@ -174,7 +175,9 @@ def build_split(dataset):
         print(f"  总形状: {n_shapes}, 训练形状: {n_train_shapes}, 验证形状: {n_val_shapes}")
         print(f"  训练数据: {train_count}, 验证数据: {val_count}")
 
-    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+    # 一并返回索引：场景指纹要拿它算"训练/验证划分"的哈希，
+    # 这是"同样的训练集、同样的验证"最硬的证据（配置没动但数据增删也会变）。
+    return Subset(dataset, train_idx), Subset(dataset, val_idx), train_idx, val_idx
 
 
 class Trainer:
@@ -221,7 +224,7 @@ class Trainer:
             ]
             print(f"[数据] 过滤频率: {C.TRAIN_FREQS}，剩余 {len(full_dataset.samples)} 条")
 
-        train_ds, val_ds = build_split(full_dataset)
+        train_ds, val_ds, self.train_idx, self.val_idx = build_split(full_dataset)
 
         # 过滤后重建 shape_to_indices，确保索引和 samples 对齐
         from collections import defaultdict
@@ -291,6 +294,21 @@ class Trainer:
         n_params = sum(p.numel() for p in self.model.parameters())
         self.n_params = int(n_params)
         print(f"[模型] {self.model_name}  参数量: {n_params:,}")
+
+        # ---- 场景与损失食谱 ----
+        # 场景 = 数据/划分/训练条件/归一化，必须一致两个 run 才可比；
+        # 损失食谱 = 允许随时改的变量，只记录不约束。详见 configs/scenario.py。
+        # 必须在 apply_experiment()/apply_cli_overrides() **之后**取，才是本次真正用的值。
+        self.scenario = SC.scenario(train_idx=self.train_idx, val_idx=self.val_idx)
+        self.loss_recipe = SC.loss_recipe()
+        # 架构指纹 = "这条结果还算不算数"的机械判据。改损失不影响它；
+        # 改模型类（增删层/改通道）会让它变，那一代的旧结果即作废。
+        self.arch_fp = SC.arch_fingerprint(self.model)
+        print(f"[场景] 指纹 {self.scenario['fingerprint']}  "
+              f"（划分 {self.scenario['split']}，训练 {len(self.train_idx)} / "
+              f"验证 {len(self.val_idx)}）")
+        print(f"[损失] \n{SC.render_loss_recipe(self.loss_recipe)}")
+        print(f"[架构] 指纹 {self.arch_fp}（改模型类才会变）")
         print(f"[模型] cfg: width={self.model_cfg.width} layers={self.model_cfg.n_layers} "
               f"modes={self.model_cfg.modes1}x{self.model_cfg.modes2} "
               f"head={self.model_cfg.head} kernel_cond={self.model_cfg.kernel_cond} "
@@ -717,13 +735,20 @@ class Trainer:
         return total_loss / n, total_rel / n, total_save_rel / n, vis_pred, vis_tgt
 
     def _save(self, path, epoch, val_loss, val_rel, val_geom):
-        """写出 checkpoint（内嵌 model_config，供 strict=True 加载）。"""
+        """写出 checkpoint（内嵌 model_config，供 strict=True 加载）。
+
+        同时内嵌场景指纹与损失食谱：加载时能立刻判断这份权重属于哪一代，
+        以及它是用哪版损失训出来的。
+        """
         return CK.save(
             path, self.model, self.model_cfg,
             optimizer=self.optimizer, epoch=epoch,
             val_loss=val_loss, val_rel=val_rel, val_geom=val_geom,
             normalizer=self.output_normalizer if self.use_output_norm else None,
-            extra={"experiment": getattr(C, "ACTIVE_EXPERIMENT", None)},
+            extra={"experiment": getattr(C, "ACTIVE_EXPERIMENT", None),
+                   "scenario": self.scenario,
+                   "loss_recipe": self.loss_recipe,
+                   "arch_fingerprint": self.arch_fp},
         )
 
     def run(self):
@@ -802,6 +827,12 @@ class Trainer:
             "best_val_loss": float(bm["val_loss"]),
             "val_rel": float(bm["val_rel"]),
             "model_config": self.model_cfg.to_dict(),
+            # 场景指纹：与别的 run 不一致就不能同表比较
+            "scenario": self.scenario,
+            # 损失食谱：允许不同，记录下来说明提升来自哪版损失
+            "loss_recipe": self.loss_recipe,
+            # 架构指纹：与当前代码重建出的模型不一致 = 这条结果已过期
+            "arch_fingerprint": self.arch_fp,
         }
         p = os.path.join(C.SAVE_DIR, "summary.json")
         with open(p, "w", encoding="utf-8") as f:

@@ -53,7 +53,13 @@ python -m tools.compare -e fno_v2 --epochs 50 --resume        # 已有 summary.j
 #   结果落 runs/<exp>_w<W>_l<L>/，汇总在 runs/summary.csv，按 val_geom 升序打表
 
 # ---- 冒烟测试（CPU 可跑，不需要 GPU）----
-python -m tools.smoke        # 注册表 / 前向反向 / ModelConfig 往返 / strict 往返 / 架构拒绝 / 实验可解析
+python -m tools.smoke        # 注册表 / 前向反向 / 往返 / 架构拒绝 / 实验 / 指标解耦 / 场景划分 / 架构指纹
+
+# ---- 结果档案（按场景代次汇总，跨代不混表）----
+python -m tools.report                          # 扫 runs/ + checkpoints/
+python -m tools.report runs/gen1 runs/gen2 --csv out.csv
+#   同场景的 run 打一张表（可直接比）；跨代的表分开打，并列出场景差异
+#   额外标出：STALE(模型类变了，旧结果作废) / GONE(模型已被删) / ?(无指纹的老 run)
 
 # ---- 评估 ----
 python -m tools.eval -c checkpoints/fno_v2/best.pth                    # 全量
@@ -119,6 +125,36 @@ class FNO2dMyIdea(FNOBase):
 - 三种条件化方式都能落在同一骨架上：编码器嵌入（`fno_attention`/`fno_film`/`fno_lora`/`afno`）走 `build_cond`；空间通道广播（`fno_baseline`/`unet`/`mlp`/`cnn`）走 `build_input` 拼常量条件图、`build_cond` 返回 `None`；混合（`fno_v2`）两个钩子都用；`vit`/`deeponet` 因输出映射方式不同，整体覆盖 `forward`。
 - **`ModelConfig.extra` 是模型专属参数的唯一通道**，由 `configs/base.py::MODEL_EXTRA` 传入（见 `model_config_from_globals()`）。它参与 `to_dict`/`from_dict` 与 `__post_init__` 之前的构造，也随 checkpoint 一起存取——所以新增模型参数不需要动 `core/config.py`，但也要注意 **`extra` 里改了默认值会让旧 checkpoint 重建出不同结构**（`strict=True` 会报错，这是期望行为）。
 - **`freq` 的契约是 `(B, 2) = [归一化频率, 极化]`**，由 `data/dataset.py` 定义（每条样本给 `(2,)`，DataLoader 批成 `(B,2)`）。`normalize_freq()` 在 `FNOBase.forward` 入口和 `UNet2d.forward` 里统一补齐：1D 视为单样本、缺极化列补 0，batch 维不匹配则抛 `ValueError`。**新写调用点时按 `(B,2)` 传**，别依赖 1D 兜底；上一版就是因为各模型对 `freq` 的切片宽度不同（宽的靠广播侥幸跑通、窄的如 `fno_v2` 的 `freq[:, 1:2]` 直接 IndexError），同一个坏输入时崩时不崩。
+
+### 结果档案：为什么换损失不必重跑基线（`configs/scenario.py`）
+
+主模型的损失函数是**要反复改的变量**，所以配置不能整体冻结。但"改了什么"必须能被机器认出来。
+`configs/scenario.py` 把 `configs/base.py` 的大写配置项分成两桶：
+
+| 桶 | 内容 | 改了怎么办 |
+|---|---|---|
+| `SCENARIO_KEYS` | 数据/划分/轮数/batch/lr/早停/输出归一化 | **换了一代**，旧 run 必须重跑；跨代数字不可比 |
+| `LOSS_KEYS` | `LOSS_ENABLE_VECTOR`/`LOSS_WEIGHT_VECTOR`/全部 `FIELD_*` 子权重 | **允许随时改**，改完仍与旧 run 可比；只记录下来解释提升来自哪版 |
+
+两桶之外是模型结构（`WIDTH`/`MODES1`/`HEAD_MODE`/`MODEL_EXTRA`），它由 `ModelConfig.to_dict()` 随 checkpoint 记录。
+
+**为什么损失可以随便改而结果仍可比**：保存/早停指标 `val_geom`/`val_rel` **不读任何损失配置**。
+`Trainer.geom_metric` 调 `field_geom_loss_eh(pred, true)` 用子权重默认值 1/1/1（不是训练侧的
+`FIELD_DIR_ANGLE_WEIGHT` 等），`rel_l2_error` 调 `channel_group_balanced_l2(pred, true)` 用
+`h_boost` 默认 1.0（不是 `FIELD_H_GROUP_WEIGHT`）。所以尺子不随损失漂移，基线的 `best.pth`
+是用同一把尺子选出来的，在新损失下**仍然是那个基线**——不必重跑。
+`tools/smoke.py::check_metric_independence` 把这条不变式钉死：把损失旋钮全部打到极端值，
+指标必须逐位不变；并静态检查 `geom_metric`/`rel_l2_error` 没把 config 值透传进去。
+
+**"要不要重跑"的机械判据是架构指纹**（`SC.arch_fingerprint`）：当前代码重建出的模型，
+其 `state_dict` 的 (键, 形状) 签名哈希。改了模型类（增删层/改通道）→ 变 → 旧结果作废；
+只改损失/学习率 → 不变 → 旧结果仍有效。这等价于"旧 checkpoint 还能否 `strict=True` 加载"，
+但不需要持有 `.pth` 就能算——`tools/report.py` 靠它给历史 run 打 `STALE`/`GONE` 标记。
+
+三个指纹都随 run 落盘（`summary.json` 与 checkpoint 的 `extra` 里）：
+`scenario.fingerprint`（含 `split` 划分指纹）、`loss_recipe.fingerprint`、`arch_fingerprint`。
+`split_fingerprint` 是"同样训练集、同样验证"最硬的证据——比哈希配置键更硬，因为数据文件
+增删改会让划分变化而配置哈希看不出来。
 
 ### 配置的生效顺序
 

@@ -158,17 +158,60 @@ def print_table(rows, failures):
         print(f"\n失败的组合 ({len(failures)}): {', '.join(failures)}")
 
 
+def check_same_scenario(rows):
+    """矩阵里的 run 必须同场景，否则这张表没有意义。
+
+    同一批 compare 通常共享场景，但 `--resume` 会捞起**历史目录**：
+    如果两代之间改过数据/划分/归一化，表里就会混进不可比的数字。
+    这里显式拦一下——发现跨代就报告差异，让用户自己决定。
+    """
+    from configs import scenario as SC
+
+    by_fp = {}
+    for r in rows:
+        fp = (r.get("scenario") or {}).get("fingerprint")
+        if fp:
+            by_fp.setdefault(fp, []).append(r.get("name"))
+    if len(by_fp) < 2:
+        return
+
+    print(f"\n[警告] 本次矩阵横跨 {len(by_fp)} 个**场景代次**，表内数字不可直接比大小：")
+    for fp, names in sorted(by_fp.items()):
+        print(f"    [{fp}]  {len(names)} 个: {', '.join(str(n) for n in names[:6])}"
+              + (" ..." if len(names) > 6 else ""))
+    ref = sorted(by_fp)[0]
+    snaps = {}
+    for r in rows:
+        sc = r.get("scenario") or {}
+        if sc.get("fingerprint") and sc["fingerprint"] not in snaps:
+            snaps[sc["fingerprint"]] = sc
+    for fp in sorted(snaps):
+        if fp == ref:
+            continue
+        d = SC.diff(snaps[ref].get("keys", {}), snaps[fp].get("keys", {}))
+        print(f"    [{ref}] -> [{fp}]  相差 {len(d)} 项")
+        for k, a, b in d[:6]:
+            print(f"        {k}: {a}  ->  {b}")
+    print("    建议：分代重跑，或按场景分组单独出表（python -m tools.report）。")
+
+
 def write_csv(rows, failures, path):
     fields = ["name", "model", "experiment", "width", "n_layers", "modes1", "modes2",
               "head", "kernel_cond", "lora_rank", "n_params",
               "val_geom", "val_rel", "best_val_loss", "best_epoch", "minutes",
-              "epochs", "save_dir", "status"]
+              "epochs", "scenario_fp", "split_fp", "loss_fp", "arch_fingerprint",
+              "save_dir", "status"]
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            w.writerow({**r, "status": "ok"})
+            sc = r.get("scenario") or {}
+            lr = r.get("loss_recipe") or {}
+            w.writerow({**r, "status": "ok",
+                        "scenario_fp": sc.get("fingerprint"),
+                        "split_fp": sc.get("split"),
+                        "loss_fp": lr.get("fingerprint")})
         for name in failures:
             w.writerow({"name": name, "status": "failed"})
     print(f"\n[汇总] {path}")
@@ -213,6 +256,7 @@ def main(argv=None):
                 break
 
     print_table(rows, failures)
+    check_same_scenario(rows)
     write_csv(rows, failures, os.path.join(args.runs_dir, "summary.csv"))
     print(f"\n总耗时 {(time.time()-t_all)/60:.1f} 分钟"
           + (f"，跳过 {len(skipped)} 个" if skipped else ""))
