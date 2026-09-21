@@ -9,7 +9,7 @@
 #   bash deploy/run_train.sh --sync -e fno_attention ...         # 先同步代码再跑
 #
 # 说明：训练默认后台跑（nohup + 日志），因为一次 1000 epoch 会很久。
-#       日志在 $REMOTE_ROOT/logs/ 下，可用 deploy/tail_train.sh 跟。
+#       日志在 $REMOTE_LOGS/ 下，可用 deploy/tail_train.sh 跟。
 # =====================================================================
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,9 +40,9 @@ for ((i=0; i<${#EXTRA[@]}; i++)); do
     [ "${EXTRA[$i]}" = "--tag" ] && TAG_ARG="${EXTRA[$((i+1))]}"
 done
 SAVE_DIR="$REMOTE_RUNS/${TAG_ARG:-run}_$STAMP"
-LOG="$REMOTE_ROOT/logs/train_${TAG_ARG:-run}_$STAMP.log"
+LOG="$REMOTE_LOGS/train_${TAG_ARG:-run}_$STAMP.log"
 
-rsh "mkdir -p '$REMOTE_RUNS' '$REMOTE_ROOT/logs'"
+rsh "mkdir -p '$REMOTE_RUNS' '$REMOTE_LOGS'"
 
 # 把数据目录指到持久盘：train.py 读 configs/base.py 的 DATA_DIR，而它默认是
 #   仓库内的 data/data。所以这里在服务器工作区建一个 data/data 软链 -> 持久数据目录。
@@ -60,13 +60,13 @@ echo "===================================================================="
 
 if [ "$FOREGROUND" = "1" ]; then
     # shellcheck disable=SC2086
-    rsh "source '$REMOTE_ENV/miniconda3/etc/profile.d/conda.sh' && conda activate $CONDA_ENV && \
+    rsh "source '$OPT_CONDA/etc/profile.d/conda.sh' && conda activate $CONDA_ENV && \
          cd '$REMOTE_REPO' && export KMP_DUPLICATE_LIB_OK=TRUE && \
          echo 'DATA_DIR 校验:' && python -c 'from configs import base as C; import os; print(\" \", C.DATA_DIR, os.path.isdir(C.DATA_DIR))' && \
          $CMD 2>&1 | tee '$LOG'"
 else
     # shellcheck disable=SC2086
-    rsh "source '$REMOTE_ENV/miniconda3/etc/profile.d/conda.sh' && conda activate $CONDA_ENV && \
+    rsh "source '$OPT_CONDA/etc/profile.d/conda.sh' && conda activate $CONDA_ENV && \
          cd '$REMOTE_REPO' && export KMP_DUPLICATE_LIB_OK=TRUE && \
          nohup $CMD > '$LOG' 2>&1 & \
          echo \$! > '$LOG.pid'; \

@@ -17,7 +17,7 @@ MODE="${1:-tail}"
 hr() { echo "----------------------------------------------------------------"; }
 
 latest_log() {
-    rsh "ls -t '$REMOTE_ROOT/logs/'*.log 2>/dev/null | head -1"
+    rsh "ls -t '$REMOTE_LOGS/'*.log 2>/dev/null | head -1"
 }
 
 case "$MODE" in

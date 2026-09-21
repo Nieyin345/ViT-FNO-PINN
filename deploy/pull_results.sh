@@ -31,6 +31,7 @@ hr() { echo "----------------------------------------------------------------"; 
 #   $REMOTE_RUNS    —— 训练时把 SAVE_DIR 指到这里（见 run_train.sh）
 #   $REMOTE_REPO/checkpoints, $REMOTE_REPO/runs —— 若有人忘了改 SAVE_DIR 的兜底
 remote_list() {
+    # 服务器上产出在 /proj（持久）与 /opt/repo（若有人忘了 --save-dir 的兜底）
     rsh "for d in '$REMOTE_RUNS' '$REMOTE_REPO/checkpoints' '$REMOTE_REPO/runs'; do \
              if [ -d \"\$d\" ]; then \
                  echo \"[\$d]\"; \
@@ -50,12 +51,17 @@ do_pull() {
     remote_list
 
     hr; echo "打包传输"; hr
-    # 服务器侧打 tar（服务器有 rsync，直接用 rsync 更稳，但为避免多一条依赖，
-    # 统一用 tar over ssh，与 push_data.sh 对称）。
-    rsh "cd '$REMOTE_ROOT' 2>/dev/null && \
-         tar -cf - \$(for d in runs repo/checkpoints repo/runs; do [ -d \"\$d\" ] && echo \"\$d\"; done) 2>/dev/null" \
-        | tar -C "$DEST" -xf - 2>/dev/null || {
-        echo "!!! 传输失败"; return 1; }
+    # 产出分布在两处（/proj 的 runs、/opt 的 repo/checkpoints），所以直接用
+    # 绝对路径打包，不靠 cd。tar 用 -P 保留绝对路径会被去掉前导 /，故改用
+    # 相对「公共父目录」不可行——这里改为逐个目录打包并解到 DEST 下同名子目录。
+    for pair in "$REMOTE_RUNS:runs" "$REMOTE_REPO/checkpoints:checkpoints" "$REMOTE_REPO/runs:repo_runs"; do
+        RDIR="${pair%%:*}"; SUB="${pair##*:}"
+        if $SSH "[ -d '$RDIR' ]" 2>/dev/null; then
+            echo "  取 $RDIR"
+            mkdir -p "$DEST/$SUB"
+            $SSH "tar -C '$RDIR' -cf - . 2>/dev/null" | tar -C "$DEST/$SUB" -xf - 2>/dev/null
+        fi
+    done
 
     hr
     echo "已回传到: $DEST"

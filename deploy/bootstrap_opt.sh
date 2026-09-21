@@ -51,7 +51,18 @@ python -V
 pip install -q --upgrade pip 2>&1 | tail -2
 # V100S = Volta, compute capability 7.0。cu121 的 wheel 覆盖它。
 pip install torch --index-url https://download.pytorch.org/whl/cu121 2>&1 | tail -8
-pip install -q "numpy>=1.24" "scipy>=1.10" "tqdm>=4.60" "matplotlib>=3.7" "h5py>=3.8" 2>&1 | tail -4
+# ★ numpy 钉在 1.x：服务器若用 numpy 2.x，torch.save 出的 checkpoint 里
+#   pickle 会记 `numpy._core`，而**本地** pytorch env 是 numpy 1.24，
+#   反序列化时报 `ModuleNotFoundError: No module named 'numpy._core'`
+#   （实测确认）。pull_results.sh 拉回来的 .pth 会直接打不开。
+#   把两侧对齐到 1.24 即可（与本地一致）。
+pip install -q "numpy>=1.24,<2" "scipy>=1.10" "tqdm>=4.60" \
+                "matplotlib>=3.7" "h5py>=3.8" 2>&1 | tail -4
+# torch 2.5 的依赖可能会把 numpy 拉回 2.x，装完再确认一次并纠偏。
+python -c "import numpy; assert numpy.__version__.startswith('1.'), numpy.__version__" 2>/dev/null || {
+    echo "[警告] numpy 被提升到 2.x，重新钉回 1.x"
+    pip install -q "numpy>=1.24,<2" 2>&1 | tail -3
+}
 
 step "自检"
 python - <<'PY'
