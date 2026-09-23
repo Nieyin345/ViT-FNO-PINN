@@ -26,10 +26,22 @@ source "$HERE/config.sh"
 BRANCH="$(git -C "$LOCAL_ROOT" rev-parse --abbrev-ref HEAD)"
 MODE="${1:-push}"
 
+# 节点 SSH 有间歇性断连（实测同一天多次 `port 22: Connection timed out`）。
+# 代码量小，重试几次即可；重试对幂等命令（mkdir/git fetch）是安全的。
+retry() {
+    local n=0
+    until "$@"; do
+        n=$((n + 1))
+        [ "$n" -ge 4 ] && { echo "    (重试 $n 次仍失败)"; return 1; }
+        echo "    (第 $n 次失败，8s 后重试)"
+        sleep 8
+    done
+}
+
 hr() { echo "----------------------------------------------------------------"; }
 
 ensure_dirs() {
-    $SSH "sudo mkdir -p '$OPT_ROOT' '$REMOTE_BARE' '$REMOTE_REPO' && \
+    retry $SSH "sudo mkdir -p '$OPT_ROOT' '$REMOTE_BARE' '$REMOTE_REPO' && \
           sudo chown -R \$(id -u):\$(id -g) '$OPT_ROOT'" || return 1
 }
 
@@ -48,15 +60,15 @@ push_code() {
     #   于是踩上 "Git Bash 摸不到 Windows ssh-agent" 那个坑，报
     #   Permission denied (publickey)。必须用 GIT_SSH_COMMAND 显式指定
     #   密钥与 IdentitiesOnly（与 config.sh 里其它 ssh 调用保持一致）。
-    local GIT_SSH="ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -i $KEY"
-    GIT_SSH_COMMAND="$GIT_SSH" \
+    local GIT_SSH="ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=25 -i $KEY"
+    retry env GIT_SSH_COMMAND="$GIT_SSH" \
         git -C "$LOCAL_ROOT" push -q "ssh://$REMOTE_USER@$NODE$REMOTE_BARE" "$BRANCH" || {
         echo "!!! push 失败（远程目录还没建？先跑 --init）"; return 1; }
     echo "push 完成"
 
     # 工作区：首次 clone，之后 fetch + 强制对齐。
     # 注意 clone 也要带 GIT_SSH_COMMAND，否则同样拿不到密钥。
-    $SSH "export GIT_SSH_COMMAND='$GIT_SSH'; \
+    retry $SSH "export GIT_SSH_COMMAND='$GIT_SSH'; \
           if [ -d '$REMOTE_REPO/.git' ]; then \
               cd '$REMOTE_REPO' && git fetch -q origin '$BRANCH' && \
               (git checkout -q '$BRANCH' 2>/dev/null || git checkout -q -b '$BRANCH' FETCH_HEAD); \

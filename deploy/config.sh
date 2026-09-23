@@ -5,7 +5,11 @@
 
 # ---- 目标节点 ----
 # 注：CloudLab 实验重启后会换 hostname，届时改 NODE 一行即可。
-NODE="clgpu016.clemson.cloudlab.us"
+# 2026-09-23: Clemson 的 GPU 实验（clgpu016/017）连不上——密钥没登记到那批节点，
+#   换到 Wisconsin 新实验（qinglong-317487）。硬件也换了：
+#   V100S×2 (Volta sm_70) -> **Tesla P100 PCIe 12GB ×1 (Pascal sm_60)**。
+#   sm_60 在 torch cu121 的 wheel 覆盖范围内，不用换 torch。
+NODE="c240g5-110205.wisc.cloudlab.us"
 REMOTE_USER="qinglong"
 
 # ---- SSH ----

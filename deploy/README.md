@@ -6,13 +6,24 @@
 
 | 项 | 值 |
 |---|---|
-| 节点 | `clgpu016.clemson.cloudlab.us`（用户 `qinglong`） |
-| 硬件 | 2× Tesla V100S-PCIE-32GB、128 vCPU、503 GB RAM |
-| 系统 | Ubuntu 22.04.2、内核 5.15.0-187 |
+| 节点 | `c240g5-110205.wisc.cloudlab.us`（用户 `qinglong`） |
+| 实验 | `qinglong-317487`（Wisconsin） |
+| 硬件 | **1× Tesla P100-PCIE-12GB（Pascal, sm_60）**、40 vCPU、187 GB RAM |
+| 系统 | Ubuntu 22.04、内核 5.15.0-187、驱动 580.178.04 |
 | 密钥 | `~/.ssh/qkd_rl/qkd_rl_deploy` |
 | 已装 | conda 到 `/opt/miniconda3`，`fno` 环境含 torch 2.5.1+cu121 |
 
 节点名只在 `config.sh` 的 `NODE=` 一处改。CloudLab 实验**每次重启都会换 hostname**。
+
+> **2026-09-23 换代记录**：上一个 Clemson 实验的 GPU 节点（`clgpu016`/`clgpu017`）
+> 连不上——密钥没登记到那批节点，`Permission denied (publickey)`，
+> 换 Windows OpenSSH、换旧密钥、从别的节点跳都无效。于是换到这个 Wisconsin 实验。
+>
+> **硬件从 V100S 换成了 P100**，两点影响：
+> - **sm_60（Pascal）**：torch cu121 的 wheel 覆盖它，不用换 torch；但 **bf16 不被支持**，
+>   只能用 fp16/fp32。显存 12GB（原 32GB×2），batch 要相应调小。
+> - **只有 1 张卡**（原 2 张），且共享 `/proj` 只剩 32G（数据 16G）。
+
 
 ## 命令
 
