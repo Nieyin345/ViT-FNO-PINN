@@ -53,7 +53,7 @@ class AFNOBlock(nn.Module):
     """
 
     def __init__(self, width: int, hidden: int, modes: int, freq_dim: int,
-                 blocks: int = 0, dropout: float = 0.0):
+                 blocks: int = 0):
         super().__init__()
         self.width = width
         self.modes = modes          # 参与变换的低频块边长
@@ -71,7 +71,6 @@ class AFNOBlock(nn.Module):
         # 通道混合（空间域 1×1），AFNO 原论文里承担"跨通道 token 混合"的角色
         self.channel_mix = nn.Conv2d(width, width, kernel_size=1)
         self.norm = nn.BatchNorm2d(width)
-        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
 
         # 条件：fused(freq+geom) 逐频率对复数偏置（hidden 个复数 = 2·hidden 个实数）；
         # freq_emb 单独做逐通道 scale（width 个复数 = 2·width 个实数）
@@ -140,7 +139,7 @@ class AFNOBlock(nn.Module):
 
         y = torch.fft.irfft2(out_ft, s=(H, W)).to(x.dtype)
         y = self.channel_mix(y)
-        return F.gelu(self.norm(x + self.dropout(y)))
+        return F.gelu(self.norm(x + y))
 
     def _to_groups(self, low: torch.Tensor, m1: int, m2: int) -> torch.Tensor:
         """(B, C, m1, m2) → (B, G, S, C)，把低频块按 blocks×blocks 切分。"""
@@ -193,9 +192,13 @@ class AFNO2d(FNOBase):
         # 注意：必须填进 self.blocks —— 基座的 forward 遍历的是它
         self.blocks = nn.ModuleList([
             AFNOBlock(cfg.width, self.hidden, cfg.modes1, cfg.freq_dim,
-                      blocks=self.n_freq_blocks, dropout=cfg.dropout)
+                      blocks=self.n_freq_blocks)
             for _ in range(cfg.n_layers)
         ])
+        # dropout 统一放在输出头之前，与其余 10 个模型一致。
+        # 原先放在 block 内部（`norm(x + dropout(y))`），n_layers=5 时一次 forward
+        # 触发 5 次、位置也不同 —— 消融表里就混进了"dropout 强度与位置"这个额外变量。
+        self.dropout = nn.Dropout2d(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         self.proj = nn.Sequential(
             nn.Conv2d(cfg.width, 64, kernel_size=1),
             nn.GELU(),
@@ -208,4 +211,4 @@ class AFNO2d(FNOBase):
         return Cond(freq_emb=self.freq_encoder(freq), geom_emb=self.geom_encoder(x))
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
+        return self.proj(self.dropout(x))

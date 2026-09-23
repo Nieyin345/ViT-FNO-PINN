@@ -30,13 +30,12 @@ class PointwiseBlock(nn.Module):
     没有任何跨像素操作，这是本基线成立的前提。
     """
 
-    def __init__(self, width: int, hidden: int, dropout: float = 0.0):
+    def __init__(self, width: int, hidden: int):
         super().__init__()
         self.norm = nn.BatchNorm2d(width)
         self.net = nn.Sequential(
             nn.Conv2d(width, hidden, kernel_size=1),
             nn.GELU(),
-            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
             nn.Conv2d(hidden, width, kernel_size=1),
         )
 
@@ -58,9 +57,13 @@ class MLP2d(FNOBase):
         # 注意 lift 在基座 super().__init__ 里就建好了，这里**不能**再赋值
         # （重建会把基座那个模块留在 _modules 里成为死参数，还会进优化器）。
         self.blocks = nn.ModuleList([
-            PointwiseBlock(cfg.width, self.hidden, dropout=cfg.dropout)
+            PointwiseBlock(cfg.width, self.hidden)
             for _ in range(cfg.n_layers)
         ])
+        # dropout 统一放在输出头之前，与其余 10 个模型一致。
+        # 原先放在 block 内部（net 序列中间），n_layers=5 时一次 forward 触发
+        # 5 次、位置也不同 —— 消融表里就混进了"dropout 强度与位置"这个额外变量。
+        self.dropout = nn.Dropout2d(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         self.proj = nn.Sequential(
             nn.Conv2d(cfg.width, 64, kernel_size=1),
             nn.GELU(),
@@ -88,4 +91,4 @@ class MLP2d(FNOBase):
         return torch.cat([x, self._broadcast_condition(x, freq)], dim=1)
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
+        return self.proj(self.dropout(x))

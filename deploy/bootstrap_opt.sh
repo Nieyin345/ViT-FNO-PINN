@@ -56,8 +56,11 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121 2>&1 | tail
 #   反序列化时报 `ModuleNotFoundError: No module named 'numpy._core'`
 #   （实测确认）。pull_results.sh 拉回来的 .pth 会直接打不开。
 #   把两侧对齐到 1.24 即可（与本地一致）。
+# ★ pandas：tools/calc_s11.py 与 field2field/calc_s11_from_field.py 都 import 它。
+#   漏装的话 "六条链路自动认得新模型" 里的 S11 那条会在新机器上 ModuleNotFoundError。
+#   （tkinter 不用装：conda 的 python 自带，且 ui_eval/visualize 靠它画图。）
 pip install -q "numpy>=1.24,<2" "scipy>=1.10" "tqdm>=4.60" \
-                "matplotlib>=3.7" "h5py>=3.8" 2>&1 | tail -4
+                "matplotlib>=3.7" "h5py>=3.8" "pandas>=1.5" 2>&1 | tail -4
 # torch 2.5 的依赖可能会把 numpy 拉回 2.x，装完再确认一次并纠偏。
 python -c "import numpy; assert numpy.__version__.startswith('1.'), numpy.__version__" 2>/dev/null || {
     echo "[警告] numpy 被提升到 2.x，重新钉回 1.x"
@@ -78,9 +81,10 @@ if torch.cuda.is_available():
     print("  GPU 矩阵乘 OK:", torch.isfinite(a @ a).all().item())
 else:
     print("  [!!] torch 看不到 CUDA")
-import numpy, scipy, matplotlib, tqdm, h5py
+import numpy, scipy, matplotlib, tqdm, h5py, pandas
 print("numpy", numpy.__version__, "| scipy", scipy.__version__,
-      "| matplotlib", matplotlib.__version__, "| h5py", h5py.__version__)
+      "| matplotlib", matplotlib.__version__, "| h5py", h5py.__version__,
+      "| pandas", pandas.__version__)
 PY
 echo
 echo "完成。conda 前缀: $CONDA_PREFIX   环境: $ENV_NAME"

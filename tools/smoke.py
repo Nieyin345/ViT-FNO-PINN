@@ -415,6 +415,75 @@ def check_experiments_resolve():
     return f"{len(seen)} 个预设实验均可解析"
 
 
+def check_dropout_consistency():
+    """守卫：所有模型的输出头 dropout 口径一致。
+
+    **为什么需要这条**：dropout 无参数，加它、删它、或挪位置都**不改变
+    state_dict 的 (键, 形状)** —— 所以架构指纹（第 9 项）和 tools/report.py
+    都看不见。实测 afno/cnn/mlp 曾把 dropout 放进每个 block 的残差里
+    （n_layers=5 → 一次 forward 触发 5 次），vit 放在 attention+MLP 里
+    （触发 10 次），而其余 7 个模型在输出头前（1 次）。这不是"能不能训"的问题，
+    是消融表里混进了"正则强度与位置"这个额外变量 —— 两个模型的差异里
+    说不清有多少来自架构、多少来自 dropout。
+
+    断言三件事：
+      1. train 模式一次 forward 里，Dropout 恰好被调用 **1** 次；
+      2. train 模式两次前向的差**显著非零**（dropout 真在起作用）；
+      3. eval 模式两次前向**恰好相同**（eval 无随机性），
+         且 dropout=0 时 train 模式也恰好相同（退化为恒等）。
+    """
+    import torch.nn as nn
+    from configs import base as C
+    from core.registry import available, build_model
+
+    saved_dp = C.PROJ_DROPOUT
+    dp_on = small_cfg(dropout=0.05, n_layers=3)
+    dp_off = small_cfg(dropout=0.0, n_layers=3)
+    x, freq = make_inputs()
+
+    problems = []
+    for name in sorted(available()):
+        m = build_model(name, dp_on)
+
+        # --- 1. 调用次数必须恰好 1 ---
+        cnt = [0]
+        hs = [mod.register_forward_hook(lambda *a: cnt.__setitem__(0, cnt[0] + 1))
+              for mod in m.modules()
+              if isinstance(mod, (nn.Dropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d))]
+        m.train()
+        with torch.no_grad():
+            m(x, freq)
+        for h in hs:
+            h.remove()
+        if cnt[0] != 1:
+            problems.append(f"{name}: dropout 触发 {cnt[0]} 次（应为 1）")
+
+        # --- 2/3. train 有随机性、eval 恰好确定 ---
+        m.train()
+        with torch.no_grad():
+            d_tr = (m(x, freq) - m(x, freq)).abs().max().item()
+        m.eval()
+        with torch.no_grad():
+            d_ev = (m(x, freq) - m(x, freq)).abs().max().item()
+        if d_tr <= 1e-6:
+            problems.append(f"{name}: train 模式两次前向无差异（dropout 没生效？）")
+        if d_ev != 0.0:
+            problems.append(f"{name}: eval 模式两次前向有差异（{d_ev:.2e}）")
+
+        # --- dropout=0 必须完全退化 ---
+        m0 = build_model(name, dp_off)
+        m0.train()
+        with torch.no_grad():
+            d0 = (m0(x, freq) - m0(x, freq)).abs().max().item()
+        if d0 != 0.0:
+            problems.append(f"{name}: dropout=0 时 train 模式仍有随机性（{d0:.2e}）")
+
+    C.PROJ_DROPOUT = saved_dp
+    assert not problems, "dropout 口径不一致：\n    " + "\n    ".join(problems)
+    return (f"{len(available())} 个模型：输出头前恰好 1 次；"
+            f"train 有随机性 / eval 恰好确定 / dropout=0 完全退化")
+
+
 def main():
     print("=" * 68)
     print("统一基座冒烟测试")
@@ -450,6 +519,9 @@ def main():
 
     print("\n[10] 基线代次配方")
     check("损失配置与当前基线代次一致", check_recipe_consistency)
+
+    print("\n[11] dropout 口径一致性（架构指纹的盲区）")
+    check("输出头前 1 次 / train 有随机性 / eval 确定", check_dropout_consistency)
 
     print("\n" + "=" * 68)
     if FAILS:

@@ -10,6 +10,10 @@ tqdm>=4.60
 # 可视化 / UI 评估（可选，缺少时自动降级跳过画图）：
 matplotlib>=3.7
 
+# S11 计算（tools/calc_s11.py、field2field/calc_s11_from_field.py）：
+#   读 HFSS 导出的 S 参数 CSV。缺了这两条链路会 ModuleNotFoundError。
+pandas>=1.5
+
 # PWS 传播工具（field2field）所需：
 #   numpy（核心传播）
 #   matplotlib（visualize.py 画图）

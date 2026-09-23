@@ -37,20 +37,19 @@ class ResConvBlock(nn.Module):
     形状不变（padding = dilation），故 64×64 全程保持。
     """
 
-    def __init__(self, width: int, dilation: int = 1, dropout: float = 0.0):
+    def __init__(self, width: int, dilation: int = 1):
         super().__init__()
         self.norm1 = nn.BatchNorm2d(width)
         self.conv1 = nn.Conv2d(width, width, 3, padding=dilation, dilation=dilation)
         self.norm2 = nn.BatchNorm2d(width)
         self.conv2 = nn.Conv2d(width, width, 3, padding=dilation, dilation=dilation)
-        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x, cond: Optional[Cond] = None):
         h = F.gelu(self.norm1(x))
         h = self.conv1(h)
         h = F.gelu(self.norm2(h))
         h = self.conv2(h)
-        return x + self.dropout(h)
+        return x + h
 
 
 @register("cnn")
@@ -66,9 +65,13 @@ class CNN2d(FNOBase):
         # 注意 lift 在基座 super().__init__ 里就建好了，这里**不能**再赋值
         # （重建会把基座那个模块留在 _modules 里成为死参数，还会进优化器）。
         self.blocks = nn.ModuleList([
-            ResConvBlock(cfg.width, dilation=2 ** (i % self.dilation_cycle), dropout=cfg.dropout)
+            ResConvBlock(cfg.width, dilation=2 ** (i % self.dilation_cycle))
             for i in range(cfg.n_layers)
         ])
+        # dropout 统一放在输出头之前，与其余 10 个模型一致。
+        # 原先放在 block 内部（`x + dropout(h)`），n_layers=5 时一次 forward 触发
+        # 5 次、位置也不同 —— 消融表里就混进了"dropout 强度与位置"这个额外变量。
+        self.dropout = nn.Dropout2d(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         self.proj = nn.Sequential(
             nn.Conv2d(cfg.width, 64, kernel_size=3, padding=1),
             nn.GELU(),
@@ -103,4 +106,4 @@ class CNN2d(FNOBase):
         return torch.cat([x, self._broadcast_condition(x, freq)], dim=1)
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
+        return self.proj(self.dropout(x))

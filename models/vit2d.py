@@ -48,15 +48,15 @@ class ViTBlock(nn.Module):
     —— 这是 DiT / adaLN-Zero 的做法，零初始化时 block 退化为恒等，训练稳定。
     """
 
-    def __init__(self, dim: int, n_heads: int, cond_dim: int, dropout: float = 0.0):
+    def __init__(self, dim: int, n_heads: int, cond_dim: int):
         super().__init__()
         self.n_heads = n_heads
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
+        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(dim * 4, dim), nn.Dropout(dropout),
+            nn.Linear(dim, dim * 4), nn.GELU(),
+            nn.Linear(dim * 4, dim),
         )
         # adaLN：cond -> (6 组 scale/shift) = attn 的 q/k/v 前 + mlp 前
         self.ada = nn.Sequential(nn.Linear(cond_dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim * 6))
@@ -117,10 +117,16 @@ class ViT2d(FNOBase):
         # stride=patch 的卷积，与 padding 不兼容。故整体覆盖 forward，
         # blocks 只用于让基座/检查点看到 Transformer 层。
         self.blocks = nn.ModuleList([
-            ViTBlock(embed_dim, n_heads, cond_dim, dropout=cfg.dropout)
+            ViTBlock(embed_dim, n_heads, cond_dim)
             for _ in range(cfg.n_layers)
         ])
         self.norm_out = nn.LayerNorm(embed_dim)
+        # dropout 统一放在输出头（head）之前，与其余 10 个模型同一口径。
+        # 原先分散在每个 block 内部（attention dropout + MLP 里两处 Dropout），
+        # n_layers=5 时一次 forward 触发 10 次 —— 消融表里混进了"dropout 强度
+        # 与位置"这个额外变量。放在 head 前 = 作用在最终 token 表示上，
+        # 与 deeponet"作用在 branch 系数上"的定位一致。
+        self.dropout = nn.Dropout(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         # 逐 token → 逐像素：把 embed_dim 映射到 patch²×out_channels
         self.head = nn.Linear(embed_dim, self.patch * self.patch * cfg.out_channels)
 
@@ -158,7 +164,7 @@ class ViT2d(FNOBase):
             tokens = blk(tokens, cond_vec)
 
         tokens = self.norm_out(tokens)[:, 1:]                           # 丢掉 CLS
-        out = self.head(tokens)                                         # (B, N, p²·C)
+        out = self.head(self.dropout(tokens))                           # (B, N, p²·C)
         out = out.reshape(B, gh, gw, self.patch, self.patch, self.cfg.out_channels)
         out = out.permute(0, 5, 1, 3, 2, 4).reshape(B, self.cfg.out_channels, gh * self.patch,
                                                     gw * self.patch)

@@ -392,27 +392,52 @@ L3 的外层权重抬上去只会放大这个失衡，不解决问题。
 真要捕捉这类改动，得把模型源码哈希并进指纹；当前没有做，**改模型内部计算时请自行
 判断是否需要重跑**，不要只信指纹。
 
+已知落在这个盲区里的改动（都在下面各自的小节里详述）：
+- FiLM 的 `shift` 从频域挪到空域（不增删 key/shape）；
+- 输出头 dropout 的**位置/次数**（`Dropout` 无参数）——但 `mlp`/`vit` 因为删掉序列里
+  一层而键名位移，那两个**是**看得见的。
+
 （上面那批"建了却不调用"的修正**会**改变 key/shape，所以指纹能看见——`vit` /
 `deeponet` 少了 `lift.*`、`vit` 少了 `cls_token`。这些模型此前的 checkpoint 一律
 `STALE`。）
 
 ### 输出头 dropout 必须在所有模型上一致（`PROJ_DROPOUT`）
 
-`configs/base.py` 的 `PROJ_DROPOUT`（默认 0.05）**只对"输出头"生效**，且历史上
-只有 5 个模型真正读了 `cfg.dropout`（`fno_v2`/`afno`/`vit`/`cnn`/`mlp`），另 6 个
-建了头却从不使用 → 主模型 `fno_attention` **完全没有正则**，而它的对比对象有。
-后果是消融表里混进了"有无 dropout"这个额外变量（实测 train 模式两次前向：主模型
-差 0.0000、`fno_v2` 差 1.19）。现在 11 个模型全部接入：在**输出头之前**加
-`Dropout2d(cfg.dropout)`（`deeponet` 无独立输出头，dropout 作用在 branch 系数上）。
+`configs/base.py` 的 `PROJ_DROPOUT`（默认 0.05）作用是**输出头之前的那一次 dropout**。
+历史上这里修过两轮，**两轮都没修干净**，值得记下来：
+
+- **第一轮**：只有 5 个模型读了 `cfg.dropout`，另 6 个建了头却从不使用 → 主模型
+  `fno_attention` **完全没有正则**，而对比对象有（实测 train 两次前向：主模型差
+  0.0000、`fno_v2` 差 1.19）。修法是"11 个模型都在输出头前加一次"。
+- **第二轮（2026-09-24）**：上面那句"11 个模型全部接入"**本身是错的**。实测一次
+  forward 里 Dropout 的调用次数：
+
+  | 模型 | 调用次数 | 位置 |
+  |---|---|---|
+  | `fno_attention` / `fno_v2` / `fno_baseline` / `fno_film` / `fno_lora` / `unet` | 1 | 输出头前 ✓ |
+  | `afno` / `cnn` / `mlp` | **5**（= `n_layers`） | block 内部残差里 |
+  | `vit` | **10** | attention dropout + MLP 里两处 |
+
+  这不是"有没有正则"的问题，是**强度差 5~10 倍、位置也不同**——消融表里"`cnn` vs
+  `fno_attention`"的差异里，说不清多少来自架构、多少来自 dropout。已全部改为输出头前
+  一次（`deeponet` 无独立输出头，作用在 branch 系数上）。**block 内部的 dropout 全部删除**，
+  参数签名里的 `dropout=` 也一并去掉。
+
+**`tools/smoke.py::check_dropout_consistency`（第 11 项）是这条约定的守卫**，断言三件事：
+train 模式一次 forward 里 Dropout **恰好触发 1 次**；train 两次前向差显著非零；
+eval 两次前向**恰好相同**，且 `dropout=0` 时 train 模式也恰好相同。**负向测试过**
+（把 `mlp` 的 dropout 挪回 block 内，守卫报"触发 4 次"）。
+
+**新模型必须接上**，否则就是"消融对照里混进额外变量"那一类。
+
+**注意两件事**（都是架构指纹的盲区，见下）：
+1. 纯移动 dropout **不改变 key/shape** → `afno`/`cnn` 的架构指纹**不变**，
+   `tools/report.py` 会把它们的旧 run 判成 `ok`。但 `mlp`/`vit` 因为**从序列里删掉了一层**，
+   键名发生位移（`net.3` → `net.2`、`mlp.3` → `mlp.2`）→ 指纹变了 → 旧 ckpt 判 `STALE`。
+2. **eval 输出逐位不变**（实测同权重同输入最大差 0.0）——dropout 只在 train 时起作用。
+   所以旧 checkpoint 的**评估指标**不受影响，但**重训**会得到不同结果。
+
 `dropout=0` 时退化为 `nn.Identity()`，不改变任何 key/shape。
-
-**新模型必须接上**：不接就是"消融对照里混进额外变量"那一类（见上一节）。核对方法
-是 `m.train()` 下连续两次 `forward` 的最大差应显著非零，`m.eval()` 下必须**恰好为 0**。
-
-**注意这是架构指纹的盲区**：`Dropout` 无参数，加/去它**不改变 `state_dict` 的
-(key, shape)**，所以 `arch_fingerprint` 和 `tools/report.py` 都看不见——实测
-`dropout=0` 与 `0.05` 的指纹完全相同。与上面 FiLM 换域是同一类问题，改它请自行判断
-是否需要重跑。
 
 
 ### 数据格式
