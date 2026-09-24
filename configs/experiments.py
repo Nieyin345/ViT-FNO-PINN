@@ -101,6 +101,19 @@ EXPERIMENTS = {
         "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
         "FREQ_INTERP_PROB": 0.0,
     },
+    # 消融：**参数逐位相同**，只把模式间成对交换（QKᵀ）换成逐模式独立变换
+    # （ctx = v，to_q/to_k 照建但不参与前向）。
+    # 为什么必须有这一条：mattn 比 fno_film 多 84K 参数（+2.9%），val_geom 只
+    # 好 2.6% —— 不排除"增益只是来自多出来的参数"。本实验把差异收敛成单一变量
+    # （有没有模式混合），是判断模式注意力**机制**是否有效的唯一干净对照。
+    "fno_mattnv_freqhold_nointerp": {
+        "model": "fno_mattn",
+        "MODEL_NAME": "fno_mattn",
+        "SAVE_DIR":   _abs("../checkpoints/fno_mattnv_freqhold_nointerp"),
+        "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
+        "FREQ_INTERP_PROB": 0.0,
+        "MODEL_EXTRA": {"mattn_use_attn": False},
+    },
     # ==================== 色散坐标谱卷积（论文主候选）====================
     # fno_film 的唯一结构替换：w0(k)·(1+g(ξ))，ξ=k/m0(f) 为无量纲色散坐标
     # （m0 = k0·L/2π 由频率物理决定）。谱形状随频率的移动变成结构自带性质，

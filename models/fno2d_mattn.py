@@ -67,10 +67,12 @@ class ModeSelfAttention(nn.Module):
     量级该由训练决定。
     """
 
-    def __init__(self, channels: int, n_heads: int = 2, d_k: int = 16):
+    def __init__(self, channels: int, n_heads: int = 2, d_k: int = 16,
+                 use_attn: bool = True):
         super().__init__()
         self.n_heads = n_heads
         self.d_k = d_k
+        self.use_attn = use_attn
         dim = 2 * channels                       # 实虚拼接后的 token 维度
         self.norm = nn.LayerNorm(dim)
         self.to_q = nn.Linear(dim, n_heads * d_k)
@@ -93,8 +95,15 @@ class ModeSelfAttention(nn.Module):
         k = self.to_k(t).reshape(B, N, self.n_heads, self.d_k).transpose(1, 2)
         v = self.to_v(t).reshape(B, N, self.n_heads, self.d_k).transpose(1, 2)
 
-        attn = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(self.d_k), dim=-1)
-        ctx = (attn @ v).transpose(1, 2).reshape(B, N, self.n_heads * self.d_k)
+        if self.use_attn:
+            attn = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(self.d_k), dim=-1)
+            ctx = attn @ v
+        else:
+            # 消融对照：跳过 QKᵀ，ctx = v —— 参数**逐位相同**（to_q/to_k 照建
+            # 但不参与前向），只是把"模式间成对交换信息"这一步换成逐模式的
+            # 独立变换。用来分离「模式混合的贡献」与「多出来的 84K 参数的贡献」。
+            ctx = v
+        ctx = ctx.transpose(1, 2).reshape(B, N, self.n_heads * self.d_k)
         delta = self.to_out(ctx)                                  # (B,N,2C)，零初始化
         delta = delta.transpose(1, 2).reshape(B, 2 * C, m1, m2)
         delta_ft = torch.complex(delta[:, :C], delta[:, C:]).to(spec_low.dtype)
@@ -109,7 +118,7 @@ class SpectralConv2dModeAttn(nn.Module):
     """
 
     def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int,
-                 freq_dim: int):
+                 freq_dim: int, use_attn: bool = True):
         super().__init__()
         scale = 1 / (in_channels * out_channels)
         self.w1 = nn.Parameter(scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat))
@@ -127,8 +136,8 @@ class SpectralConv2dModeAttn(nn.Module):
         nn.init.zeros_(self.film_net[-1].weight)
         nn.init.zeros_(self.film_net[-1].bias)
 
-        # ---- 模式注意力（本模型唯一新增）：作用于**输入谱**的 C_in 个通道
-        self.mode_attn = ModeSelfAttention(in_channels)
+        # ---- 模式注意力（本模型唯一新增），可关（消融对照）
+        self.mode_attn = ModeSelfAttention(in_channels, use_attn=use_attn)
 
     def forward(self, x: torch.Tensor, cond=None) -> torch.Tensor:
         freq_emb = cond.freq_emb if isinstance(cond, Cond) else None
@@ -174,9 +183,11 @@ class SpectralConv2dModeAttn(nn.Module):
 class FNOBlockModeAttn(nn.Module):
     """FiLM 谱卷积 + 模式注意力 + bypass + BN + GELU + 残差（结构与 FNOBlockFiLM 对齐）。"""
 
-    def __init__(self, width: int, modes1: int, modes2: int, freq_dim: int):
+    def __init__(self, width: int, modes1: int, modes2: int, freq_dim: int,
+                 use_attn: bool = True):
         super().__init__()
-        self.spectral = SpectralConv2dModeAttn(width, width, modes1, modes2, freq_dim=freq_dim)
+        self.spectral = SpectralConv2dModeAttn(width, width, modes1, modes2,
+                                               freq_dim=freq_dim, use_attn=use_attn)
         self.bypass = nn.Conv2d(width, width, kernel_size=1)
         self.norm = nn.BatchNorm2d(width)
 
@@ -192,7 +203,8 @@ class FNO2dModeAttn(FNOBase):
         super().__init__(cfg)
 
         self.blocks = nn.ModuleList([
-            FNOBlockModeAttn(cfg.width, cfg.modes1, cfg.modes2, freq_dim=cfg.freq_dim)
+            FNOBlockModeAttn(cfg.width, cfg.modes1, cfg.modes2, freq_dim=cfg.freq_dim,
+                             use_attn=cfg.extra.get("mattn_use_attn", True))
             for _ in range(cfg.n_layers)
         ])
 
