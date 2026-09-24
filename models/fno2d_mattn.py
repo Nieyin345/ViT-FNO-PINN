@@ -42,33 +42,63 @@ from core.registry import register
 
 
 class ModeSelfAttention(nn.Module):
-    """谱域模式间自注意力（对低频块做修正）。"""
+    """模式轴自注意力：token = 每个模式的**通道向量**（保留全部通道信息）。
 
-    def __init__(self, d_k: int = 32):
+    对照标准 FNO 谱卷积的模式对角性（实测扰动一个输入模式、泄漏到其他模式的
+    比例为 0.00e+00）：本模块是每层里唯一的**模式间耦合算子**，补上「层内
+    零模式混合」这个结构缺失。
+
+    ### 为什么是 v2（v1 的三处失效，均由探针 P6 实测定位）
+
+    v1 的实现是 token = 通道平均后的 2 维 (Re, Im)、输出广播回所有通道、
+    Q/K 未归一化。P6 实测：
+
+      | 症状 | v1 实测 | 本版对应修法 |
+      |---|---|---|
+      | 修正对输出无影响 | 修正/主干 **0.00~0.10%** | 输出经 `to_out` 映射回通道（不再广播），容量与通道数相称 |
+      | softmax 完全饱和 | 熵 **0.000**/4.159，有效位置 **1.6%** | 输入 `LayerNorm` 归一化（同 CLAUDE.md 记录的 `sig_norm` 修法） |
+      | token 信息量不足 | token 仅 2 维（通道平均抹平） | token 保留全部 `2C` 维（实虚拼接） |
+
+    起点恒等：`to_out` 零初始化 → 修正项 = 0。梯度链与 film_net 同构
+    （末层零初始化 + 残差，`∂L/∂to_out = (∂L/∂x_mixed)·ctxᵀ ≠ 0`），能正常启动。
+
+    刻意**不设 γ 门控**：γ 只是人为压制修正量级（v2 试过 γ=0.1，实测修正仍
+    仅 0.1% 量级、梯度 1e-12），而零初始化的 `to_out` 已经保证了起点恒等，
+    量级该由训练决定。
+    """
+
+    def __init__(self, channels: int, n_heads: int = 2, d_k: int = 16):
         super().__init__()
+        self.n_heads = n_heads
         self.d_k = d_k
-        self.Wq = nn.Linear(2, d_k)
-        self.Wk = nn.Linear(2, d_k)
-        # Wv 零初始化 → 起点无扰动；γ 提供梯度链（同 film_net 的启动机制）
-        self.Wv = nn.Linear(2, 2)
-        nn.init.zeros_(self.Wv.weight)
-        nn.init.zeros_(self.Wv.bias)
-        self.gamma = nn.Parameter(torch.tensor(0.1))
+        dim = 2 * channels                       # 实虚拼接后的 token 维度
+        self.norm = nn.LayerNorm(dim)
+        self.to_q = nn.Linear(dim, n_heads * d_k)
+        self.to_k = nn.Linear(dim, n_heads * d_k)
+        self.to_v = nn.Linear(dim, n_heads * d_k)
+        self.to_out = nn.Linear(n_heads * d_k, dim)
+        nn.init.zeros_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
 
-    def forward(self, out_low: torch.Tensor) -> torch.Tensor:
-        """out_low: (B, C, m1, m2) complex -> 同形状（+修正）"""
-        B, C, m1, m2 = out_low.shape
-        # token = 每个模式的通道平均复数值（先取实虚，再转 float）
-        t = out_low.mean(dim=1)                                    # (B,m1,m2) complex
-        feat = torch.stack([t.real.float(), t.imag.float()], dim=-1).reshape(B, m1 * m2, 2)
-        q, k = self.Wq(feat), self.Wk(feat)
-        scores = torch.bmm(q, k.transpose(1, 2)) / math.sqrt(self.d_k)
-        attn = torch.softmax(scores, dim=-1)
-        ctx = torch.bmm(attn, feat)                                # (B,N,2)
-        corr = self.gamma * self.Wv(ctx)                           # (B,N,2)
-        corr = corr.reshape(B, m1, m2, 2)
-        corr_ft = torch.complex(corr[..., 0], corr[..., 1]).to(out_low.dtype)
-        return out_low + corr_ft.unsqueeze(1)
+    def forward(self, spec_low: torch.Tensor) -> torch.Tensor:
+        """spec_low: (B, C, m1, m2) complex -> 同形状（+模式间混合残差）"""
+        B, C, m1, m2 = spec_low.shape
+        N = m1 * m2
+        # token: 每个模式的通道向量（实虚拼接，保留全部信息）
+        t = torch.cat([spec_low.real, spec_low.imag], dim=1)      # (B,2C,m1,m2)
+        t = t.reshape(B, 2 * C, N).transpose(1, 2)                # (B,N,2C)
+        t = self.norm(t)
+
+        q = self.to_q(t).reshape(B, N, self.n_heads, self.d_k).transpose(1, 2)
+        k = self.to_k(t).reshape(B, N, self.n_heads, self.d_k).transpose(1, 2)
+        v = self.to_v(t).reshape(B, N, self.n_heads, self.d_k).transpose(1, 2)
+
+        attn = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(self.d_k), dim=-1)
+        ctx = (attn @ v).transpose(1, 2).reshape(B, N, self.n_heads * self.d_k)
+        delta = self.to_out(ctx)                                  # (B,N,2C)，零初始化
+        delta = delta.transpose(1, 2).reshape(B, 2 * C, m1, m2)
+        delta_ft = torch.complex(delta[:, :C], delta[:, C:]).to(spec_low.dtype)
+        return spec_low + delta_ft
 
 
 class SpectralConv2dModeAttn(nn.Module):
@@ -97,8 +127,8 @@ class SpectralConv2dModeAttn(nn.Module):
         nn.init.zeros_(self.film_net[-1].weight)
         nn.init.zeros_(self.film_net[-1].bias)
 
-        # ---- 模式注意力（本模型唯一新增）
-        self.mode_attn = ModeSelfAttention()
+        # ---- 模式注意力（本模型唯一新增）：作用于**输入谱**的 C_in 个通道
+        self.mode_attn = ModeSelfAttention(in_channels)
 
     def forward(self, x: torch.Tensor, cond=None) -> torch.Tensor:
         freq_emb = cond.freq_emb if isinstance(cond, Cond) else None
@@ -114,20 +144,26 @@ class SpectralConv2dModeAttn(nn.Module):
         out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
             "bixy,ioxy->boxy", x_ft[:, :, -self.modes1:, :self.modes2], self.w2)
 
+        m1 = min(self.modes1, H)
+        m2 = min(self.modes2, W // 2 + 1)
+
+        # ---- 模式间注意力：对投影后的低频块做数据依赖的模式混合。
+        # 立论：标准 FNO 的 `einsum("bixy,ioxy->boxy")` 只对输入通道求和、模式
+        # 索引原样保留 —— 层内**零模式混合**（实测扰动一个输入模式、泄漏到其他
+        # 模式的比例 0.00e+00）。这是每层唯一的模式耦合算子。
+        # 位置必须在投影**之后**：放在 `w1` 之前时修正量会被 `w1` 的初始尺度
+        # （≈2.4e-4）乘一道，梯度被压到 1e-11、根本起不来（实测 v2.1）。
+        out_ft_low = self.mode_attn(out_ft[:, :, :m1, :m2])
+
         shift = None
         if freq_emb is not None and geom_emb is not None:
             c = torch.cat([freq_emb, geom_emb], dim=-1)
             film_params = self.film_net(c)
             scale = film_params[:, :self.out_channels].view(B, self.out_channels, 1, 1)
             shift = film_params[:, self.out_channels:].view(B, self.out_channels, 1, 1)
-            # scale 在频域乘（频域逐通道缩放 == 空域逐通道缩放）；
-            # shift 留到 irfft2 之后空域加（频域加常数 = 空域 delta 冲激）。
-            out_ft = out_ft * (1.0 + scale).to(out_ft.dtype)
+            out_ft_low = out_ft_low * (1.0 + scale).to(out_ft.dtype)
 
-        # ---- 模式间注意力（低频块，仅 FiLM 之后、irfft2 之前）
-        m1 = min(self.modes1, H)
-        m2 = min(self.modes2, W // 2 + 1)
-        out_ft[:, :, :m1, :m2] = self.mode_attn(out_ft[:, :, :m1, :m2])
+        out_ft[:, :, :m1, :m2] = out_ft_low
 
         y = torch.fft.irfft2(out_ft, s=(H, W)).to(x.dtype)
         if shift is not None:

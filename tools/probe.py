@@ -245,14 +245,16 @@ def p4_attention_health(model, x):
 def p6_mode_attention(model, xs):
     """[P6] 模式轴注意力健康度 —— 针对 fno_mattn 的 `mode_attn`。
 
-    与 P4 的两个关键差别：
-      1. 轴不同：P4 在**通道维** softmax（fno_attention），这里在**模式维**
-         （N = m1·m2 个 token）softmax。有效位置数相对 N 才有意义。
-      2. 必须同时量「修正的贡献」：‖γ·Wv(ctx)‖ / ‖out_low‖。若这个比例 ≈ 0，
-         说明注意力修正在数值上没进入输出，再"健康"的注意力也是摆设。
+    三个量，缺一不可：
+      1. **修正贡献** `‖γ·to_out(ctx)‖ / ‖spec_low‖` —— 比例 ≈0 说明注意力
+         在数值上没进入输出。v1 实测 0.00~0.10%，就是这么被抓出来的。
+      2. **softmax 健康度**：熵 / 最大权重 / 有效位置，分母是 N=m1·m2（模式数）。
+         v1 实测熵 0.000、有效位置 1.6%，完全饱和退化成 hard argmax。
+      3. **逐样本变化性**：同一层在不同几何上的注意力图应有差异。若逐样本
+         完全一致，它只是个静态重参数化，不构成"自适应谱滤波"。
 
-    另加**逐样本变化性**：同一层在不同几何上的注意力图若有差异，才是
-    "自适应滤波"；若完全一致，只是一个静态重参数化，不构成创新点。
+    修 v1 的三处：token 从 2 维通道平均改为完整 2C 维、加 LayerNorm、
+    输出经 to_out 映射回通道（因此本探针按 v2 的属性名 to_q/to_k/to_v/to_out）。
     """
     print("\n[P6] 模式轴注意力健康度（fno_mattn.mode_attn）")
     captured = []
@@ -261,7 +263,7 @@ def p6_mode_attention(model, xs):
         captured.append((mod, inp[0].detach()))
 
     hooks = [mod.register_forward_hook(hook)
-             for _, mod in model.named_modules() if hasattr(mod, "Wv") and hasattr(mod, "Wq")]
+             for _, mod in model.named_modules() if hasattr(mod, "to_q") and hasattr(mod, "to_out")]
     if not hooks:
         print("  未找到模式注意力层（模型非 fno_mattn 系列）")
         return None
@@ -274,44 +276,49 @@ def p6_mode_attention(model, xs):
         h.remove()
 
     n_layers = len(captured) // len(xs)
-    worst_ratio, worst_eff = None, None
+    worst_ratio, worst_eff, worst_var = None, None, None
     for li in range(n_layers):
         mod = captured[li][0]
         ratios, ents, effs, maxws, attn_maps = [], [], [], [], []
         for si in range(len(xs)):
-            out_low = captured[li + si * n_layers][1]           # (B,C,m1,m2)
-            B, C, m1, m2 = out_low.shape
-            t = out_low.mean(dim=1)
-            feat = torch.stack([t.real.float(), t.imag.float()], dim=-1).reshape(B, m1 * m2, 2)
-            q, k = mod.Wq(feat), mod.Wk(feat)
-            sc = torch.bmm(q, k.transpose(1, 2)) / math.sqrt(mod.d_k)
-            attn = torch.softmax(sc, dim=-1)
-            ctx = torch.bmm(attn, feat)
-            corr = mod.gamma * mod.Wv(ctx)
-            corr_ft = torch.complex(corr[..., 0], corr[..., 1]).reshape(B, m1, m2)
-            ratios.append((corr_ft.abs().norm() / out_low.abs().norm().clamp_min(1e-12)).item())
-            N = attn.size(-1)
+            spec = captured[li + si * n_layers][1]              # (B,C,m1,m2) complex
+            B, C, m1, m2 = spec.shape
+            N = m1 * m2
+            t = torch.cat([spec.real, spec.imag], dim=1).reshape(B, 2 * C, N).transpose(1, 2)
+            t = mod.norm(t)
+            q = mod.to_q(t).reshape(B, N, mod.n_heads, mod.d_k).transpose(1, 2)
+            k = mod.to_k(t).reshape(B, N, mod.n_heads, mod.d_k).transpose(1, 2)
+            v = mod.to_v(t).reshape(B, N, mod.n_heads, mod.d_k).transpose(1, 2)
+            attn = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(mod.d_k), dim=-1)
+            ctx = (attn @ v).transpose(1, 2).reshape(B, N, mod.n_heads * mod.d_k)
+            outv = mod.to_out(ctx)
+            delta = outv.transpose(1, 2).reshape(B, 2 * C, m1, m2)
+            delta_ft = torch.complex(delta[:, :C], delta[:, C:])
+            ratios.append((delta_ft.abs().norm() / spec.abs().norm().clamp_min(1e-12)).item())
             ent = -(attn * (attn + 1e-12).log()).sum(-1).mean().item()
             ents.append(ent)
             effs.append(math.exp(ent) / N)
             maxws.append(attn.max(-1).values.mean().item())
-            attn_maps.append(attn[0])
-        # 逐样本变化性：不同几何的注意力图的最大相对差
+            attn_maps.append(attn[0].mean(0))                    # 多头平均后比较
         var = max((attn_maps[i] - attn_maps[0]).abs().max().item() for i in range(len(xs)))
-        print(f"  层{li} (N={m1 * m2}): γ={mod.gamma.item():.4f}  "
-              f"|Wv|均{mod.Wv.weight.abs().mean().item():.3e}  "
+        print(f"  层{li} (N={N}): "
+              f"|to_out|均{mod.to_out.weight.abs().mean().item():.3e}  "
               f"修正/主干 {np.mean(ratios):.2%}  "
-              f"熵 {np.mean(ents):.3f}/{math.log(m1 * m2):.3f}  最大权重 {np.mean(maxws):.4f}  "
+              f"熵 {np.mean(ents):.3f}/{math.log(N):.3f}  最大权重 {np.mean(maxws):.4f}  "
               f"有效位置 {np.mean(effs):.1%}  跨样本差异 {var:.2e}")
         if worst_ratio is None or np.mean(ratios) < worst_ratio:
             worst_ratio = np.mean(ratios)
         if worst_eff is None or np.mean(effs) < worst_eff:
             worst_eff = np.mean(effs)
+        if worst_var is None or var < worst_var:
+            worst_var = var
     if worst_ratio < 0.01:
-        print(f"  [!!] 注意力修正占主干输出仅 {worst_ratio:.2%} —— 数值上等于没接")
+        print(f"  [!!] 注意力修正占主干仅 {worst_ratio:.2%} —— 数值上等于没接")
     if worst_eff > 0.9:
         print(f"  [~] 注意力过于均匀（{worst_eff:.1%}）—— 未学到模式选择性")
-    return {"min_ratio": worst_ratio, "min_eff": worst_eff}
+    if worst_var < 1e-4:
+        print(f"  [!!] 注意力图逐样本几乎不变（{worst_var:.2e}）—— 只是静态重参数化")
+    return {"min_ratio": worst_ratio, "min_eff": worst_eff, "min_var": worst_var}
 
 
 def p5_frequency_generalization(model, normalizer, holdout=(10.0, 11.0)):
