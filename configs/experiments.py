@@ -67,6 +67,18 @@ EXPERIMENTS = {
         "SAVE_DIR":   _abs("../checkpoints/fno_film_freqhold"),
         "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
     },
+    # 同上，但**关闭频率插值增强**。实测线性插值标签本身有 11%~19% 的误差
+    # （场随频率振荡，等间隔三点插值不成立），30% 的 batch 拿到的是假标签；
+    # 但它也可能是模型学会频点间过渡的唯一来源。A/B 定净效应：
+    #   若关闭后 freqhold 的 val_geom 更差 -> 增强虽脏但有效，保留
+    #   若更好 -> 灌假标签是净伤害，直接关掉
+    "fno_film_freqhold_nointerp": {
+        "model": "fno_film",
+        "MODEL_NAME": "fno_film",
+        "SAVE_DIR":   _abs("../checkpoints/fno_film_freqhold_nointerp"),
+        "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
+        "FREQ_INTERP_PROB": 0.0,
+    },
     # 消融：完全关闭超网络注意力，等价于普通 FNO 频域卷积。
     # 注意：关掉时注意力模块（W_q/W_k/hyper_*/gamma）**根本不创建**，
     # 所以这是"与主模型同宽同层、只少了注意力机制"的干净消融，不是容量对照。
