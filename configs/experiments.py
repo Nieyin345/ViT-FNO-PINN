@@ -79,6 +79,16 @@ EXPERIMENTS = {
         "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
         "FREQ_INTERP_PROB": 0.0,
     },
+    # 当前最优配置（nointerp）+ em_split 头（H 显式依赖 E 预测）。
+    # 回答"H 头看到 E 预测"这个结构先验在 FiLM 骨架上是否仍有增益。
+    "fno_film_em_split_freqhold_nointerp": {
+        "model": "fno_film",
+        "MODEL_NAME": "fno_film",
+        "SAVE_DIR":   _abs("../checkpoints/fno_film_em_freqhold_nointerp"),
+        "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
+        "FREQ_INTERP_PROB": 0.0,
+        "HEAD_MODE": "em_split",
+    },
     # 消融：完全关闭超网络注意力，等价于普通 FNO 频域卷积。
     # 注意：关掉时注意力模块（W_q/W_k/hyper_*/gamma）**根本不创建**，
     # 所以这是"与主模型同宽同层、只少了注意力机制"的干净消融，不是容量对照。

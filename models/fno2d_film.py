@@ -106,6 +106,17 @@ class FNO2dFiLM(FNOBase):
 
     def __init__(self, cfg: ModelConfig):
         super().__init__(cfg)
+        out_channels = cfg.out_channels
+
+        # head='em_split'：H 头显式依赖 E 的预测（与 fno_attention 的 em_split 同构）。
+        # 物理依据：H 场由麦克斯韦方程与 E 耦合，让 H 头看到 E 的预测比 6 个
+        # 独立头各猜各的更有约束。默认仍是 n_heads 个独立头。
+        self.use_em_heads = (cfg.head == "em_split")
+        if self.use_em_heads and out_channels != 12:
+            raise ValueError(
+                f"head='em_split' 需要 out_channels=12，得到 {out_channels}。"
+                f"请改用默认头或修正 out_channels。"
+            )
 
         self.blocks = nn.ModuleList([
             FNOBlockFiLM(cfg.width, cfg.modes1, cfg.modes2, freq_dim=cfg.freq_dim)
@@ -118,9 +129,13 @@ class FNO2dFiLM(FNOBase):
         self.shared_proj = nn.Sequential(
             nn.Conv2d(cfg.width, 64, kernel_size=1), nn.GELU()
         )
-        self.heads = nn.ModuleList([
-            DirectionHead(in_channels=64) for _ in range(cfg.n_heads)
-        ])
+        if self.use_em_heads:
+            self.e_heads = nn.ModuleList([DirectionHead(in_channels=64) for _ in range(3)])
+            self.h_heads = nn.ModuleList([DirectionHead(in_channels=64 + 6) for _ in range(3)])
+        else:
+            self.heads = nn.ModuleList([
+                DirectionHead(in_channels=64) for _ in range(cfg.n_heads)
+            ])
 
     def build_cond(self, x, freq):
         if freq is None:
@@ -130,4 +145,9 @@ class FNO2dFiLM(FNOBase):
 
     def output_head(self, x: torch.Tensor) -> torch.Tensor:
         shared = self.dropout(self.shared_proj(x))
+        if self.use_em_heads:
+            e_pred = torch.cat([h(shared) for h in self.e_heads], dim=1)
+            h_input = torch.cat([shared, e_pred], dim=1)
+            h_pred = torch.cat([h(h_input) for h in self.h_heads], dim=1)
+            return torch.cat([e_pred, h_pred], dim=1)
         return torch.cat([h(shared) for h in self.heads], dim=1)
