@@ -47,6 +47,8 @@ from data.dataset import EMMultiFreqDataset
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+FREQS_GHZ = [8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 12.0]
+
 
 def hr(t=""):
     print("-" * 72)
@@ -158,71 +160,131 @@ def p3_modulation_strength(model):
 
 
 def p4_attention_health(model, x):
-    """注意力 softmax 的熵 / 最大权重 / 有效位置数。饱和 = 退化成 argmax。"""
+    """注意力 softmax 的熵 / 最大权重 / 有效位置数。饱和 = 退化成 argmax。
+
+    ★ 必须用**该层真实的输入**来算。SpectralConv2d 拿到的不是模型输入
+    （2 通道），而是上一层出来的 (B, width, H, W) —— 用模型输入复算会得到
+    C_in=2，注意力在 2 个通道上做 softmax，统计量毫无意义（恒为均匀）。
+    所以这里用 forward_hook 把真实输入抓下来。
+    """
     print("\n[P4] 注意力健康度")
-    stats = []
-    hooks = []
+    records = []
 
-    def make_hook(name):
-        def hook(mod, inp, out):
-            # 重算一次 softmax 统计（forward 内部已算过，这里复算便于观测）
-            stats.append(name)
-        return hook
+    def hook(mod, inp, out):
+        records.append((mod, inp[0]))
 
-    for name, mod in model.named_modules():
-        if hasattr(mod, "W_q"):
-            hooks.append(mod.register_forward_hook(make_hook(name)))
+    hooks = [mod.register_forward_hook(hook)
+             for _, mod in model.named_modules() if hasattr(mod, "W_q")]
+    if not hooks:
+        print("  模型未启用注意力")
+        return
+
     model.eval()
     with torch.no_grad():
         model(x, torch.tensor([[0.375, 0.0]], device=DEVICE))
     for h in hooks:
         h.remove()
-    print(f"  启用注意力的谱卷积层数: {len(stats)}")
-    if not stats:
-        print("  模型未启用注意力")
-        return
 
-    # 手动复算熵：取第一层，观察 scores 分布
-    for name, mod in model.named_modules():
-        if not hasattr(mod, "W_q"):
-            continue
+    print(f"  启用注意力的谱卷积层数: {len(records)}")
+    worst_eff = None
+    for i, (mod, xin) in enumerate(records):
         with torch.no_grad():
-            x_ft = torch.fft.rfft2(x.float())
+            x_ft = torch.fft.rfft2(xin.float())
             C_in = x_ft.size(1)
             m1 = min(mod.n_modes_attn, x_ft.size(2))
             m2 = min(mod.n_modes_attn, x_ft.size(3))
             sig = x_ft[:, :, :m1, :m2]
             if m1 < mod.n_modes_attn or m2 < mod.n_modes_attn:
-                pad = torch.zeros(x.size(0), C_in, mod.n_modes_attn, mod.n_modes_attn,
-                                  device=DEVICE, dtype=torch.cfloat)
+                pad = torch.zeros(xin.size(0), C_in, mod.n_modes_attn, mod.n_modes_attn,
+                                  device=xin.device, dtype=torch.cfloat)
                 pad[:, :, :m1, :m2] = sig
                 sig = pad
-            X_sig = sig.reshape(x.size(0), C_in, -1)
+            X_sig = sig.reshape(xin.size(0), C_in, -1)
             if getattr(mod, "sig_norm", True):
                 X_sig = X_sig / X_sig.abs().pow(2).sum(-1, keepdim=True).sqrt().clamp_min(1e-6)
-            Q = torch.bmm(X_sig, mod.W_q.unsqueeze(0).expand(x.size(0), -1, -1))
-            K = torch.bmm(X_sig, mod.W_k.unsqueeze(0).expand(x.size(0), -1, -1))
+            Q = torch.bmm(X_sig, mod.W_q.unsqueeze(0).expand(xin.size(0), -1, -1))
+            K = torch.bmm(X_sig, mod.W_k.unsqueeze(0).expand(xin.size(0), -1, -1))
             sc = torch.bmm(Q, K.conj().transpose(1, 2)) / math.sqrt(mod.d_k)
             w = torch.softmax(sc.abs() * mod.score_scale, dim=-1)
             ent = -(w * (w + 1e-12).log()).sum(-1).mean().item()
             maxw = w.max(-1).values.mean().item()
             eff = math.exp(ent)
-        print(f"  {name}:")
-        print(f"    |logit| max {sc.abs().max().item():.4e}")
-        print(f"    熵 {ent:.4f}  (均匀={math.log(C_in):.4f})")
-        print(f"    最大权重 {maxw:.4f}  (=1/C_in 是 {1.0 / C_in:.4f})")
-        print(f"    有效位置数 {eff:.2f}  (={C_in} 表示均匀)")
-        if eff < 1.5:
-            print("    [!!] 注意力接近硬 argmax（饱和）")
-        elif abs(eff - C_in) < 0.5:
-            print("    [~] 注意力接近均匀 —— 可能还没学到选择性")
-        break   # 只看第一层，避免刷屏
+        ratio = eff / C_in
+        print(f"  层{i} (C_in={C_in}): |logit|max {sc.abs().max().item():.3e}  "
+              f"熵 {ent:.3f}/{math.log(C_in):.3f}  最大权重 {maxw:.4f}  有效位置 {eff:.2f}/{C_in} "
+              f"({ratio:.1%})")
+        if worst_eff is None or ratio < worst_eff:
+            worst_eff = ratio
+    if worst_eff < 0.2:
+        print(f"  [!!] 有层注意力饱和（有效位置仅占 {worst_eff:.1%}），接近硬 argmax")
+    elif worst_eff > 0.8:
+        print(f"  [~] 注意力偏均匀（最低 {worst_eff:.1%}）—— 是否学到了选择性存疑")
+
+
+def p5_frequency_generalization(model, normalizer, holdout=(10.0, 11.0)):
+    """留出频点泛化：在**指定频点**上测误差，与其余频点对比。
+
+    ★ 为什么这个探针最重要：现有的 val_geom 是**按形状**划分的，训练/验证的
+    9 个频点和 2 个极化完全一样（实测确认），所以它只衡量"新形状"，**测不到
+    频率/极化泛化** —— 而这正是本项目的核心目标。用一个不测目标的指标去选
+    模型，选出的可能是形状拟合更好、频率插值更差的那个。
+
+    这里复用数据集本身（它负责散射场相减与输出反归一化），只是**只取留出频点**
+    的样本算误差，与已见频点对比。比值 = 频率泛化的代价。
+
+    注意：这只是**诊断**，不改变训练/早停口径（那需要动 build_split，见 README）。
+    """
+    from torch.utils.data import DataLoader, Subset
+    print(f"\n[P5] 留出频点泛化诊断（留出 {list(holdout)} GHz）")
+    ds = EMMultiFreqDataset(
+        data_dir=C.DATA_DIR,
+        target_d_over_lambda=C.TARGET_D_OVER_LAMBDA,
+        use_scatter=C.USE_SCATTER_FIELD,
+        bg_params_path=C.BACKGROUND_PARAMS_PATH,
+        polarizations=C.DATASET_POLARIZATIONS,
+    )
+    if normalizer is not None:
+        ds.set_output_normalization(normalizer)
+
+    f = getattr(__import__("models.losses", fromlist=["x"]), "field_geom_loss_eh")
+    model.eval()
+    stats = {"seen": [], "hold": []}
+    for fg in FREQS_GHZ:
+        idx = [i for i, s in enumerate(ds.samples) if abs(s["freq_ghz"] - fg) < 1e-6]
+        if not idx:
+            continue
+        loader = DataLoader(Subset(ds, idx), batch_size=16, shuffle=False, num_workers=0)
+        errs = []
+        with torch.no_grad():
+            for b in loader:
+                inp = b["input"].to(DEVICE)
+                tgt = b["output"].to(DEVICE)
+                freq = b["freq"].to(DEVICE)
+                pred = model(inp, freq)
+                if normalizer is not None:
+                    pred = normalizer.denormalize(pred)
+                errs.append(f(tgt, pred).item())
+        m = float(np.mean(errs))
+        key = "hold" if any(abs(fg - h) < 1e-6 for h in holdout) else "seen"
+        stats[key].append((fg, m))
+        flag = "  <-- 留出" if key == "hold" else ""
+        print(f"  {fg:5.1f} GHz: Geom {m:.4f}{flag}")
+    if not stats["hold"]:
+        print("  留出频点无数据")
+        return None
+    s_mean = float(np.mean([m for _, m in stats["seen"]]))
+    h_mean = float(np.mean([m for _, m in stats["hold"]]))
+    print(f"  已见频点平均 {s_mean:.4f}  |  留出频点平均 {h_mean:.4f}  "
+          f"|  代价 {h_mean / (s_mean + 1e-12):.3f}x")
+    return {"seen": s_mean, "holdout": h_mean, "per_freq": stats}
 
 
 def main():
     ap = argparse.ArgumentParser(description="模型条件化有效性探针")
     ap.add_argument("--checkpoint", "-c", required=True)
     ap.add_argument("--sample-dir", default="data/data/rectangle/rectangle_1")
+    ap.add_argument("--holdout", default="10.0,11.0",
+                    help="留出频点（逗号分隔 GHz，用于 P5）")
     args = ap.parse_args()
 
     lc = load_checkpoint(args.checkpoint)
@@ -233,10 +295,12 @@ def main():
     print("=" * 72)
 
     x = get_sample(args.sample_dir)
+    holdout = tuple(float(t) for t in args.holdout.split(",") if t.strip())
     p1_condition_sensitivity(model, x)
     p2_embedding_separability(model)
     p3_modulation_strength(model)
     p4_attention_health(model, x)
+    p5_frequency_generalization(model, lc.normalizer, holdout=holdout)
     hr()
     print("探针完成。")
 
