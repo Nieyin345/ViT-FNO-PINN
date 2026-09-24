@@ -59,6 +59,14 @@ EXPERIMENTS = {
         "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
         "SPECTRAL_ATTENTION_ENABLE": False,
     },
+    # FiLM 的频率留出版本：与上面两个同口径（同划分、同留出频点），
+    # 用于回答"频率泛化上 FiLM 是否同样不输主模型"。
+    "fno_film_freqhold": {
+        "model": "fno_film",
+        "MODEL_NAME": "fno_film",
+        "SAVE_DIR":   _abs("../checkpoints/fno_film_freqhold"),
+        "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
+    },
     # 消融：完全关闭超网络注意力，等价于普通 FNO 频域卷积。
     # 注意：关掉时注意力模块（W_q/W_k/hyper_*/gamma）**根本不创建**，
     # 所以这是"与主模型同宽同层、只少了注意力机制"的干净消融，不是容量对照。
