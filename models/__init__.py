@@ -11,6 +11,7 @@
 
 from . import fno2d            # noqa: F401  fno_attention
 from . import fno2d_baseline   # noqa: F401  fno_baseline
+from . import fno2d_disp       # noqa: F401  fno_disp（色散坐标谱卷积）
 from . import fno2d_film       # noqa: F401  fno_film
 from . import fno2d_lora       # noqa: F401  fno_lora
 from . import fno2d_v2         # noqa: F401  fno_v2

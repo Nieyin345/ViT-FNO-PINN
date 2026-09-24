@@ -89,6 +89,21 @@ EXPERIMENTS = {
         "FREQ_INTERP_PROB": 0.0,
         "HEAD_MODE": "em_split",
     },
+    # ==================== 色散坐标谱卷积（论文主候选）====================
+    # fno_film 的唯一结构替换：w0(k)·(1+g(ξ))，ξ=k/m0(f) 为无量纲色散坐标
+    # （m0 = k0·L/2π 由频率物理决定）。谱形状随频率的移动变成结构自带性质，
+    # 8→12 GHz 的插值不再只靠条件化。模式间注意力在模式维做 softmax
+    # （对照主模型的通道维）。
+    #
+    # A/B 口径与最优对照 nointerp_long 完全一致：频率留出 + 关插值 + 100 轮。
+    # 对照组 val_geom=0.2265。模型名 fno_disp。
+    "fno_disp_freqhold_nointerp": {
+        "model": "fno_disp",
+        "MODEL_NAME": "fno_disp",
+        "SAVE_DIR":   _abs("../checkpoints/fno_disp_freqhold_nointerp"),
+        "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
+        "FREQ_INTERP_PROB": 0.0,
+    },
     # 消融：完全关闭超网络注意力，等价于普通 FNO 频域卷积。
     # 注意：关掉时注意力模块（W_q/W_k/hyper_*/gamma）**根本不创建**，
     # 所以这是"与主模型同宽同层、只少了注意力机制"的干净消融，不是容量对照。

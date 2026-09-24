@@ -32,11 +32,15 @@ class Cond:
     - `fused()`：把非 None 的分量按 [freq, pol, geom] 顺序拼接，供
       "核条件化"类块（FNO2dV2 的 SpectralConv2dV2）使用。
     - 各分量单独可取，供 FiLM / LoRA / 注意力类块按需组合。
+    - `freq_raw`：**原始归一化频率标量** (B,1)，可选。嵌入向量里反推不回
+      确定的标量（Fourier 特征是振荡的），而物理量（如色散尺度 m0 = f·L/c）
+      需要原始值。默认 None，既有模型不受影响。
     """
 
     freq_emb: Optional[torch.Tensor] = None
     geom_emb: Optional[torch.Tensor] = None
     pol_emb: Optional[torch.Tensor] = None
+    freq_raw: Optional[torch.Tensor] = None
 
     def fused(self) -> Optional[torch.Tensor]:
         parts = [e for e in (self.freq_emb, self.pol_emb, self.geom_emb) if e is not None]
@@ -47,7 +51,8 @@ class Cond:
         return torch.cat(parts, dim=-1)
 
     def is_empty(self) -> bool:
-        return self.freq_emb is None and self.geom_emb is None and self.pol_emb is None
+        return (self.freq_emb is None and self.geom_emb is None
+                and self.pol_emb is None)
 
 
 def normalize_freq(freq: Optional[torch.Tensor], batch_size: int) -> Optional[torch.Tensor]:
