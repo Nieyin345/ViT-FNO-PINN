@@ -89,6 +89,18 @@ EXPERIMENTS = {
         "FREQ_INTERP_PROB": 0.0,
         "HEAD_MODE": "em_split",
     },
+    # ==================== 模式间谱自注意力（注意力×FNO 的干净结合）====================
+    # fno_mattn = fno_film 原样 + 模式间自注意力修正（γ·Wv 门控、Wv 零初始化）。
+    # 出厂态数值上等于 film（修正恒 0），训练中注意力把「固定线性模式混合器
+    # w1/w2」变成逐样本自适应混合。同口径 A/B 回答：模式轴的注意力是否有增益
+    # （对照通道轴注意力实测均匀退化、贡献仅 5.3%）。
+    "fno_mattn_freqhold_nointerp": {
+        "model": "fno_mattn",
+        "MODEL_NAME": "fno_mattn",
+        "SAVE_DIR":   _abs("../checkpoints/fno_mattn_freqhold_nointerp"),
+        "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
+        "FREQ_INTERP_PROB": 0.0,
+    },
     # ==================== 色散坐标谱卷积（论文主候选）====================
     # fno_film 的唯一结构替换：w0(k)·(1+g(ξ))，ξ=k/m0(f) 为无量纲色散坐标
     # （m0 = k0·L/2π 由频率物理决定）。谱形状随频率的移动变成结构自带性质，
