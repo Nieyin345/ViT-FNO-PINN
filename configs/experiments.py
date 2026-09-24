@@ -129,6 +129,36 @@ EXPERIMENTS = {
         "TRAIN_FREQS": [10.5],
         "FREQ_INTERP_PROB": 0.0,
     },
+    # ==================== WIME 波先验乘法编码（arXiv 2408.02971 的适配）====================
+    # 该工作针对"训练只有稀疏离散波长、要在未见波长泛化"，与本项目同构。
+    # 核心：条件嵌入不做成标量，而做成**2D 空间波图样**（谱一致性），
+    # 每层与特征图逐元素相乘注入。
+    #
+    # 适配：原文是斜入射平面波相位斜坡，本项目周期边界+垂直入射，改用
+    # Floquet 模式基 + 频率相关倏逝衰减（实测 k_c 随 f 上升、高阶模占比涨 16 倍）。
+    #
+    # A/B 口径与最优对照 nointerp_long 完全一致（频率留出 + 关插值 + 100 轮）。
+    # 三臂对照：
+    #   fno_wime(use=True)   → WIME 有没有增益
+    #   fno_wime(use=False)  → 关掉后应与 fno_film 逐位一致（证明是单变量对照）
+    #   fno_film             → 参考点 0.2265
+    "fno_wime_freqhold_nointerp": {
+        "model": "fno_wime",
+        "MODEL_NAME": "fno_wime",
+        "SAVE_DIR":   _abs("../checkpoints/fno_wime_freqhold_nointerp"),
+        "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
+        "FREQ_INTERP_PROB": 0.0,
+    },
+    # 消融：关掉 WIME 通路（参数逐位保留，只是波先验不注入）。
+    # 作用：排除"多出来的参数"这个混杂变量，与 mattnv 的做法一致。
+    "fno_wime_off_freqhold_nointerp": {
+        "model": "fno_wime",
+        "MODEL_NAME": "fno_wime",
+        "SAVE_DIR":   _abs("../checkpoints/fno_wime_off_freqhold_nointerp"),
+        "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
+        "FREQ_INTERP_PROB": 0.0,
+        "MODEL_EXTRA": {"wime_mode": "off"},
+    },
     # ==================== 色散坐标谱卷积（论文主候选）====================
     # fno_film 的唯一结构替换：w0(k)·(1+g(ξ))，ξ=k/m0(f) 为无量纲色散坐标
     # （m0 = k0·L/2π 由频率物理决定）。谱形状随频率的移动变成结构自带性质，
