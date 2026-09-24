@@ -5,11 +5,16 @@
 
 # ---- 目标节点 ----
 # 注：CloudLab 实验重启后会换 hostname，届时改 NODE 一行即可。
-# 2026-09-23: Clemson 的 GPU 实验（clgpu016/017）连不上——密钥没登记到那批节点，
-#   换到 Wisconsin 新实验（qinglong-317487）。硬件也换了：
-#   V100S×2 (Volta sm_70) -> **Tesla P100 PCIe 12GB ×1 (Pascal sm_60)**。
-#   sm_60 在 torch cu121 的 wheel 覆盖范围内，不用换 torch。
-NODE="c240g5-110205.wisc.cloudlab.us"
+# 历史（每次换节点都记一笔，避免"以为还是同一台"）：
+#   2026-09-23  clgpu016/017 (Clemson) 密钥没登记、连不上
+#               -> c240g5-110205 (Wisconsin, qinglong-317487)  P100 12G sm_60
+#   2026-09-24  c240g5-110205 失联，新实验 qinglong-317580：
+#               -> d7525-10s10333.wisc.cloudlab.us   **A30 24G sm_80**
+#   ★ A30 出厂开了 MIG 但**没建实例**（Pending: Disabled 也清不掉，reset 报
+#     "In use by another client"，因为 nvidia_drm/modeset 占着设备）。
+#     不重启的修法是**建一个实例**：`sudo nvidia-smi mig -cgi 2g.12gb -C`
+#     -> torch 立刻可见（11.8GiB / cc8.0）。改 MIG 模式本身才需要重启。
+NODE="d7525-10s10333.wisc.cloudlab.us"
 REMOTE_USER="qinglong"
 
 # ---- SSH ----
