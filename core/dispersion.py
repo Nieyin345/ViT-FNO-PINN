@@ -66,11 +66,13 @@ class DispersionSpectralConv(nn.Module):
         self.w1 = nn.Parameter(scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat))
         self.w2 = nn.Parameter(scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat))
 
-        # ---- g(ξx,ξy)：色散坐标上的共享函数。
+        # ---- g_c(ξx,ξy)：色散坐标上的**逐输出通道**函数。
         # 2D 三角基: η2d = η(ξx) ⊗ η(ξy)，n_eta = 2n+1 -> n_eta² 个基。
-        # g = <θ, η2d>，θ: (n_eta, n_eta) 实数，全模式共享（"谱形状的物理先验"）。
+        # g_c = <θ_c, η2d>，θ: (C_out, n_eta, n_eta)。第一版全模式共享只有
+        # n_eta²=81 个参数，同容量对照下欠拟合（val 停在 0.255，film 0.228）；
+        # 逐通道后 64×81≈5.2K/层，与 film_net 的 33K 同量级。
         self.n_eta = 2 * n_basis + 1
-        self.theta = nn.Parameter(torch.zeros(self.n_eta, self.n_eta))
+        self.theta = nn.Parameter(torch.zeros(out_channels, self.n_eta, self.n_eta))
 
         # ---- 色散尺度修正 δ(freq, geom)：介质基板使有效 k 偏离自由空间，
         # 且贴片形状（几何）会影响有效介质环境。输入与 fno_film 的 film_net
@@ -133,13 +135,13 @@ class DispersionSpectralConv(nn.Module):
         low_pos = torch.einsum("bixy,ioxy->boxy", x_ft[:, :, :m1, :m2], self.w1)
         low_neg = torch.einsum("bixy,ioxy->boxy", x_ft[:, :, -m1:, :m2], self.w2)
 
-        # ---- 色散调制 g(ξx,ξy)（乘在两块低频上；零初始化 -> 起点恒等）
+        # ---- 色散调制 g_c(ξx,ξy)（乘在两块低频上；零初始化 -> 起点恒等）
         eta_y = self._eta(xi_y)                                   # (B,m1,n_eta)
         eta_x = self._eta(xi_x)                                   # (B,m2,n_eta)
-        # 2D 基 = 外积。g[b,i,j] = Σ_{p,q} theta[p,q]·η_y[b,i,p]·η_x[b,j,q]
-        g = torch.einsum("pq,bip,bjq->bij",
-                         self.theta, eta_y, eta_x)                # (B,m1,m2)
-        gmod = (1.0 + g).to(low_pos.dtype).unsqueeze(1)           # (B,1,m1,m2)
+        # g_c[b,o,i,j] = Σ_{p,q} theta[o,p,q]·η_y[b,i,p]·η_x[b,j,q]
+        g = torch.einsum("opq,bip,bjq->boij",
+                         self.theta, eta_y, eta_x)                # (B,C_out,m1,m2)
+        gmod = (1.0 + g).to(low_pos.dtype)                        # (B,C,m1,m2)
         low_pos = low_pos * gmod
         low_neg = low_neg * gmod
 
