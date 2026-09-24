@@ -34,6 +34,31 @@ EXPERIMENTS = {
         "MODEL_NAME": "fno_attention",
         "SAVE_DIR":   _abs("../checkpoints/fno_attention"),
     },
+    # ============ 频率泛化口径（本项目的核心目标，此前**没有**被度量）============
+    # 现有的 val_geom 是**按形状**划分的：训练/验证的 9 个频点与 2 个极化完全
+    # 相同（实测确认），所以它只衡量"新形状"，**测不到频率/极化泛化**。
+    # 用一个不测目标的指标去选模型，选出的可能是形状拟合更好、频率插值更差的那个。
+    #
+    # 这两个实验用现成的 TRAIN_FREQS 机制把**频点**留出（训练只见 7 个频点），
+    # 于是 val_geom 变成真正的"未见频点"误差。留出的 10.0/11.0 GHz 是等间隔
+    # 9 点里的**内插点**（不是外推），符合"宽带内插值"这个真实诉求。
+    #
+    # 注：留出频点后样本量降到 7/9。若要同时保留全量训练，另建一个
+    # "训练用全部频点、评估时单独过滤"的口径——但那要动 build_split，
+    # 会改变所有历史 run 的划分指纹，先不做。
+    "fno_attention_freqhold": {
+        "model": "fno_attention",
+        "MODEL_NAME": "fno_attention",
+        "SAVE_DIR":   _abs("../checkpoints/fno_attention_freqhold"),
+        "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
+    },
+    "fno_attention_no_attn_freqhold": {
+        "model": "fno_attention",
+        "MODEL_NAME": "fno_attention",
+        "SAVE_DIR":   _abs("../checkpoints/fno_attention_no_attn_freqhold"),
+        "TRAIN_FREQS": [8.0, 8.5, 9.0, 9.5, 10.5, 11.5, 12.0],
+        "SPECTRAL_ATTENTION_ENABLE": False,
+    },
     # 消融：完全关闭超网络注意力，等价于普通 FNO 频域卷积。
     # 注意：关掉时注意力模块（W_q/W_k/hyper_*/gamma）**根本不创建**，
     # 所以这是"与主模型同宽同层、只少了注意力机制"的干净消融，不是容量对照。
