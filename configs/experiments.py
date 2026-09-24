@@ -114,6 +114,21 @@ EXPERIMENTS = {
         "FREQ_INTERP_PROB": 0.0,
         "MODEL_EXTRA": {"mattn_use_attn": False},
     },
+    # ============ 单频点对照：多频点共享容量是否伤害单频点拟合 ============
+    # 说明：现有模型要在 7 个频点上共享同一套谱权重（w1/w2 与几何无关、
+    # 频率只经 FiLM 的逐通道标量进入）。问题：这份容量被摊薄了吗？
+    # 做法：只训练**单个频点**（TRAIN_FREQS=[10.5]），其余完全同口径。
+    # 关键可比性：build_split 按 (category, shape) 分层，与频点无关，
+    # 所以单频点模型的验证形状与 nointerp_long 是**同一批**，val_geom 可直接比。
+    # 判据：若单频点在 10.5 GHz 的误差显著低于 nointerp_long 在该频点的
+    # 0.2084 → 多频点确实在摊薄容量；若相当或更差 → 容量不是瓶颈。
+    "fno_film_single_105": {
+        "model": "fno_film",
+        "MODEL_NAME": "fno_film",
+        "SAVE_DIR":   _abs("../checkpoints/fno_film_single_105"),
+        "TRAIN_FREQS": [10.5],
+        "FREQ_INTERP_PROB": 0.0,
+    },
     # ==================== 色散坐标谱卷积（论文主候选）====================
     # fno_film 的唯一结构替换：w0(k)·(1+g(ξ))，ξ=k/m0(f) 为无量纲色散坐标
     # （m0 = k0·L/2π 由频率物理决定）。谱形状随频率的移动变成结构自带性质，
