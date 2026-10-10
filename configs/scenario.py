@@ -52,6 +52,7 @@ SCENARIO_KEYS = (
     "BACKGROUND_PARAMS_PATH",
     "VAL_RATIO",
     "SHUFFLE_SEED",
+    "TRAIN_SEED",
     # 训练条件
     "N_EPOCHS",
     "BATCH_SIZE",
@@ -62,6 +63,9 @@ SCENARIO_KEYS = (
     "EARLY_STOP_PATIENCE",
     "EARLY_STOP_MIN_DELTA",
     "FREQ_INTERP_PROB",
+    "AUG_SHIFT",
+    "HOLDOUT_FREQS",
+    "TRAIN_SHAPE_FRAC",
     # 输出归一化：改这里旧 checkpoint 直接加载不进去，属于换了一代
     "USE_OUTPUT_STANDARDIZATION",
     "OUTPUT_NORM_MODE",
@@ -115,6 +119,9 @@ LOSS_NAMES = (
 )
 
 
+_OMIT_IF_DEFAULT = {"AUG_SHIFT": False, "TRAIN_SEED": None, "HOLDOUT_FREQS": [], "TRAIN_SHAPE_FRAC": 1.0}
+
+
 def _jsonable(v):
     """把配置值转成可稳定序列化的形式。"""
     if isinstance(v, (list, tuple)):
@@ -137,7 +144,11 @@ def snapshot(keys, base_module=None) -> dict:
     out = {}
     for k in keys:
         if hasattr(base_module, k):
-            out[k] = _jsonable(getattr(base_module, k))
+            v = getattr(base_module, k)
+            # 后加的键取默认值时不写入快照：保持旧 checkpoint 的场景指纹不变。
+            if k in _OMIT_IF_DEFAULT and v == _OMIT_IF_DEFAULT[k]:
+                continue
+            out[k] = _jsonable(v)
     return out
 
 

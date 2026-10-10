@@ -51,6 +51,8 @@ from core.registry import available as available_models, build_model
 from configs import base as C
 from configs import scenario as SC
 from data.dataset import EMMultiFreqDataset
+# 相位表的频带端点:存 checkpoint 时一并写进去,离线评估才能重建同一个相位系。
+from data.dataset import FREQ_MIN as _FMIN_SAVE, FREQ_MAX as _FMAX_SAVE
 from models.losses import (
     field_rel_l2_loss, field_geom_loss, field_geom_loss_eh, freq_band_loss,
     dc_ac_rel_loss, dc_ac_directional_mean_loss, highfreq_suppress_loss,
@@ -60,10 +62,11 @@ from models.losses import (
 
 def _grads_finite(model):
     """所有参数的梯度是否都有限（None 视为有限，即该参数本轮未参与）。"""
-    for p in model.parameters():
-        if p.grad is not None and not torch.isfinite(p.grad).all():
-            return False
-    return True
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    if not grads:
+        return True
+    norms = torch._foreach_norm(grads)
+    return bool(torch.isfinite(torch.stack(norms)).all().item())
 
 
 def parse_args(argv=None):
@@ -90,7 +93,11 @@ def parse_args(argv=None):
     g.add_argument("--lr", type=float, default=None)
     g.add_argument("--num-workers", type=int, default=None,
                    help="DataLoader worker 数（Windows 上调低可加速小数据调试）")
-    g.add_argument("--seed", type=int, default=None, help="随机种子（默认用配置里的）")
+    g.add_argument("--seed", type=int, default=None,
+                   help="SHUFFLE_SEED：决定 train/val 划分（同时是默认的初始化种子）")
+    g.add_argument("--train-seed", type=int, default=None,
+                   help="TRAIN_SEED：只决定初始化/增强/dropout 的随机性，划分不变。"
+                        "做「固定划分、多随机种子」的重复实验时用它，而不是 --seed")
     g.add_argument("--device", default=None, help="cuda / cpu（默认自动判断）")
     g.add_argument("--loss-space", default=None, choices=["physical", "normalized"])
     # 明知与基线代次配方不一致仍要跑时用（结果不可与基线同表比较）
@@ -117,7 +124,7 @@ def apply_cli_overrides(args):
     simple = {
         "WIDTH": args.width, "N_LAYERS": args.layers,
         "N_EPOCHS": args.epochs, "BATCH_SIZE": args.batch_size,
-        "LR": args.lr, "SHUFFLE_SEED": args.seed,
+        "LR": args.lr, "SHUFFLE_SEED": args.seed, "TRAIN_SEED": args.train_seed,
         "NUM_WORKERS": args.num_workers,
         "LORA_RANK": args.lora_rank, "HEAD_MODE": args.head,
         "KERNEL_COND_MODE": args.kernel_cond, "LOSS_SPACE": args.loss_space,
@@ -149,6 +156,10 @@ def build_split(dataset):
 
     rng = torch.Generator().manual_seed(C.SHUFFLE_SEED)
     train_idx, val_idx = [], []
+    # 保留频点（HOLDOUT_FREQS）：这些频点的样本既不进训练也不进常规验证，
+    # 单独记到 dataset.holdout_idx[(组名, 频点)]，由 Trainer.evaluate_holdout 评估。
+    hold_freqs = {float(f) for f in (C.get("HOLDOUT_FREQS") or [])}
+    holdout = {}
 
     print("按类别分层划分:")
     print("=" * 50)
@@ -163,10 +174,31 @@ def build_split(dataset):
         # 随机选择验证集形状
         perm = torch.randperm(n_shapes, generator=rng).tolist()
         val_shapes = set(shapes[i] for i in perm[:n_val_shapes])
+        # TRAIN_SHAPE_FRAC<1：学习曲线实验。验证形状不变，训练形状只取其余形状里的前一部分，
+        # 被丢弃的形状整个不参与（既不训练也不进任何评估组）。
+        _frac = float(C.get("TRAIN_SHAPE_FRAC", 1.0) or 1.0)
+        drop_shapes = set()
+        if _frac < 1.0:
+            rest = [shapes[i] for i in perm[n_val_shapes:]]
+            keep_n = max(1, int(round(len(rest) * _frac)))
+            drop_shapes = set(rest[keep_n:])
+            n_train_shapes = keep_n
         
         # 统计数据量
         train_count = val_count = 0
         for shape_name, idxs in category_groups[category].items():
+            if shape_name in drop_shapes:
+                continue
+            if hold_freqs:
+                grp = "unseenF_unseenS" if shape_name in val_shapes else "unseenF_seenS"
+                kept = []
+                for i in idxs:
+                    f = float(dataset.samples[i]["freq_ghz"])
+                    if f in hold_freqs:
+                        holdout.setdefault((grp, f), []).append(i)
+                    else:
+                        kept.append(i)
+                idxs = kept
             if shape_name in val_shapes:
                 val_idx.extend(idxs)
                 val_count += len(idxs)
@@ -177,6 +209,12 @@ def build_split(dataset):
         print(f"{category}:")
         print(f"  总形状: {n_shapes}, 训练形状: {n_train_shapes}, 验证形状: {n_val_shapes}")
         print(f"  训练数据: {train_count}, 验证数据: {val_count}")
+
+    dataset.holdout_idx = holdout
+    if holdout:
+        print("保留频点评估集（不参与训练/选模）:")
+        for (grp, f), ii in sorted(holdout.items()):
+            print(f"  {grp}@{f:g}GHz: {len(ii)} 条")
 
     # 一并返回索引：场景指纹要拿它算"训练/验证划分"的哈希，
     # 这是"同样的训练集、同样的验证"最硬的证据（配置没动但数据增删也会变）。
@@ -279,20 +317,46 @@ class Trainer:
 
         print(f"[数据] 训练: {len(train_ds)}, 验证: {len(val_ds)}")
 
+        _pw = bool(C.NUM_WORKERS > 0)
         self.train_loader = DataLoader(
             train_ds, batch_size=C.BATCH_SIZE, shuffle=True,
-            num_workers=C.NUM_WORKERS, pin_memory=C.PIN_MEMORY, drop_last=True
+            num_workers=C.NUM_WORKERS, pin_memory=C.PIN_MEMORY, drop_last=True,
+            persistent_workers=_pw,
         )
         self.val_loader = DataLoader(
             val_ds, batch_size=C.BATCH_SIZE, shuffle=False,
-            num_workers=C.NUM_WORKERS, pin_memory=C.PIN_MEMORY
+            num_workers=C.NUM_WORKERS, pin_memory=C.PIN_MEMORY,
+            persistent_workers=_pw,
         )
+
+        # 保留频点的评估 loader（HOLDOUT_FREQS 为空时是空字典）
+        self.holdout_loaders = {}
+        for (grp, f), ii in sorted(getattr(full_dataset, "holdout_idx", {}).items()):
+            self.holdout_loaders[f"{grp}@{f:g}GHz"] = DataLoader(
+                Subset(full_dataset, ii), batch_size=C.BATCH_SIZE, shuffle=False,
+                num_workers=C.NUM_WORKERS, pin_memory=C.PIN_MEMORY,
+                persistent_workers=_pw)
 
         # 模型：由 configs/base.py 的全局值构造出唯一的 ModelConfig，再交给注册表。
         # 所有模型统一签名 __init__(cfg: ModelConfig)，无需按名字分支拼 kwargs。
         self.model_name = C.model_name_from_globals()
         self.model_cfg = C.model_config_from_globals()
         self.model = build_model(self.model_name, self.model_cfg).to(self.device)
+        # 相位参考系：网络在去旋转系输出，内部旋转回原始系后再进入损失/指标（见 core/phase_frame.py）
+        # 权重 EMA（EMA_DECAY>0 启用）：验证/保留频点评估/保存 best 都用 EMA 权重
+        self._ema = None
+        self._ema_decay = float(getattr(C, "EMA_DECAY", 0.0))
+        if self._ema_decay > 0:
+            self._ema = {k: v.detach().clone() for k, v in self.model.state_dict().items() if v.dtype.is_floating_point}
+            print(f"[EMA] 启用，decay={self._ema_decay}", flush=True)
+        self.phase_frame = None
+        if bool(getattr(C, "PHASE_FRAME", False)):
+            assert self.output_normalizer is not None, "PHASE_FRAME 需要 USE_OUTPUT_STANDARDIZATION"
+            from core.phase_frame import PhaseFrame
+            from data.dataset import FREQ_MIN as _FMIN, FREQ_MAX as _FMAX
+            self.phase_frame = PhaseFrame(self.output_normalizer, _FMIN, _FMAX, self.device,
+                                          scale=float(getattr(C, "PHASE_FRAME_SCALE", 1.0)))
+            print("[相位系] 已启用 PhaseFrame", flush=True)
 
         n_params = sum(p.numel() for p in self.model.parameters())
         self.n_params = int(n_params)
@@ -445,6 +509,47 @@ class Trainer:
             for i in range(1, len(w)):
                 w[i] *= gate
         return w
+
+    @torch.no_grad()
+    def _ema_update(self):
+        if self._ema is None:
+            return
+        if not hasattr(self, "_ema_pairs") or self._ema_pairs is None:
+            sd = self.model.state_dict()
+            self._ema_pairs = (
+                [self._ema[k] for k in self._ema if k in sd],
+                [sd[k] for k in self._ema if k in sd],
+            )
+        ema_list, src_list = self._ema_pairs
+        d = self._ema_decay
+        torch._foreach_mul_(ema_list, d)
+        torch._foreach_add_(ema_list, src_list, alpha=1.0 - d)
+
+    def _ema_swap(self):
+        import contextlib
+        @contextlib.contextmanager
+        def _cm():
+            if self._ema is None:
+                yield
+                return
+            sd = self.model.state_dict()
+            backup = {k: sd[k].detach().clone() for k in self._ema}
+            with torch.no_grad():
+                for k, v in self._ema.items():
+                    sd[k].copy_(v)
+            try:
+                yield
+            finally:
+                with torch.no_grad():
+                    for k, v in backup.items():
+                        sd[k].copy_(v)
+        return _cm()
+
+    def _fwd(self, inp, freq):
+        pred = self.model(inp, freq)
+        if self.phase_frame is not None:
+            pred = self.phase_frame(pred, freq)
+        return pred
 
     def _denorm_output(self, x):
         if self._denorm_tp is None:
@@ -662,6 +767,22 @@ class Trainer:
         true_p = self._denorm_output(true)
         return field_geom_loss_eh(pred_p, true_p)
 
+    @staticmethod
+    def _random_periodic_shift(inp, tgt):
+        """对 batch 内每个样本独立地做随机周期平移（inp、tgt 用同一组 (sx, sy)）。
+
+        周期元胞 + 正入射 ⇒ 平移等变：整体平移贴片，散射场同样整体平移。
+        要求 inp/tgt 的空间尺寸一致（都是元胞的 H×W 采样），否则原样返回。
+        """
+        if inp.shape[-2:] != tgt.shape[-2:]:
+            return inp, tgt
+        B, H, W = inp.shape[0], inp.shape[-2], inp.shape[-1]
+        sx = torch.randint(0, H, (B,)).tolist()
+        sy = torch.randint(0, W, (B,)).tolist()
+        inp = torch.stack([torch.roll(inp[b], (sx[b], sy[b]), (-2, -1)) for b in range(B)])
+        tgt = torch.stack([torch.roll(tgt[b], (sx[b], sy[b]), (-2, -1)) for b in range(B)])
+        return inp, tgt
+
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
@@ -669,6 +790,7 @@ class Trainer:
         total_save_rel = 0
         use_freq_interp = getattr(C, "FREQ_INTERP_PROB", 0.0) > 0
         interp_prob = getattr(C, "FREQ_INTERP_PROB", 0.0)
+        aug_shift = bool(getattr(C, "AUG_SHIFT", False))
         dataset = self.train_loader.dataset
         # 获取底层 dataset（可能被 Subset 包装）
         from torch.utils.data import Subset
@@ -702,7 +824,10 @@ class Trainer:
                         new_freq[b] = alpha * freq[b] + (1 - alpha) * freq_b.view_as(freq[b])
                 tgt  = new_tgt
                 freq = new_freq
-            pred = self.model(inp, freq)
+            # 周期平移增强（AUG_SHIFT）：带相邻平面 out_zminus 的 batch 无法同步平移，跳过
+            if aug_shift and "out_zminus" not in batch:
+                inp, tgt = self._random_periodic_shift(inp, tgt)
+            pred = self._fwd(inp, freq)
             loss = self.loss_fn(pred, tgt, epoch=epoch, batch=batch)
             
             # 检查NaN/Inf
@@ -727,6 +852,7 @@ class Trainer:
             if clip_max_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_max_norm)
             self.optimizer.step()
+            self._ema_update()
             total_loss += loss.item()
             with torch.no_grad():
                 total_rel += self.rel_l2_error(pred, tgt).item()
@@ -735,6 +861,10 @@ class Trainer:
         return total_loss / n, total_rel / n, total_save_rel / n
 
     def validate(self, epoch=1):
+        with self._ema_swap():
+            return self._validate_raw(epoch)
+
+    def _validate_raw(self, epoch=1):
         self.model.eval()
         total_loss = 0
         total_rel  = 0
@@ -745,7 +875,7 @@ class Trainer:
                 inp  = batch["input"].to(self.device)
                 tgt  = batch["output"].to(self.device)
                 freq = batch["freq"].to(self.device)
-                pred = self.model(inp, freq)
+                pred = self._fwd(inp, freq)
                 total_loss += self.loss_fn(pred, tgt, epoch=epoch, batch=batch).item()
                 total_rel += self.rel_l2_error(pred, tgt).item()
                 total_save_rel += self.geom_metric(pred, tgt).item()
@@ -753,6 +883,36 @@ class Trainer:
                     vis_pred, vis_tgt = self._denorm_output(pred).detach(), self._denorm_output(tgt).detach()
         n = len(self.val_loader)
         return total_loss / n, total_rel / n, total_save_rel / n, vis_pred, vis_tgt
+
+    def evaluate_holdout(self):
+        with self._ema_swap():
+            return self._evaluate_holdout_raw()
+
+    def _evaluate_holdout_raw(self):
+        """在保留频点评估集上算 geom / rel（每组一条），返回 {名: {geom, rel, n}}。"""
+        if not self.holdout_loaders:
+            return {}
+        self.model.eval()
+        out = {}
+        with torch.no_grad():
+            for name, loader in self.holdout_loaders.items():
+                g = r = 0.0
+                nb = n = 0
+                for batch in loader:
+                    inp = batch["input"].to(self.device)
+                    tgt = batch["output"].to(self.device)
+                    freq = batch["freq"].to(self.device)
+                    pred = self._fwd(inp, freq)
+                    g += self.geom_metric(pred, tgt).item()
+                    r += self.rel_l2_error(pred, tgt).item()
+                    nb += 1
+                    n += inp.shape[0]
+                out[name] = {"geom": g / max(nb, 1), "rel": r / max(nb, 1), "n": n}
+        return out
+
+    def _ema_save(self, path, epoch, val_loss, val_rel, val_geom):
+        with self._ema_swap():
+            return self._save(path, epoch, val_loss, val_rel, val_geom)
 
     def _save(self, path, epoch, val_loss, val_rel, val_geom):
         """写出 checkpoint（内嵌 model_config，供 strict=True 加载）。
@@ -768,7 +928,14 @@ class Trainer:
             extra={"experiment": getattr(C, "ACTIVE_EXPERIMENT", None),
                    "scenario": self.scenario,
                    "loss_recipe": self.loss_recipe,
-                   "arch_fingerprint": self.arch_fp},
+                   "arch_fingerprint": self.arch_fp,
+                   # 相位系必须随权重一起存:离线评估要靠它决定是否把输出旋转回物理系
+                   # (见 core/checkpoint.py 里那段)。不存的话,所有评估都会少一步旋转,
+                   # 而且只在 10 GHz 看起来是对的。
+                   "phase_frame": bool(getattr(C, "PHASE_FRAME", False)),
+                   "phase_frame_scale": float(getattr(C, "PHASE_FRAME_SCALE", 1.0)),
+                   "phase_frame_fmin": float(_FMIN_SAVE),
+                   "phase_frame_fmax": float(_FMAX_SAVE)},
         )
 
     def run(self):
@@ -792,7 +959,7 @@ class Trainer:
             # 始终保存最新权重，便于中断恢复与回看最近状态
             latest_every = int(getattr(C, "SAVE_LATEST_EVERY", 1))
             if latest_every > 0 and (epoch % latest_every == 0):
-                self._save(f"{C.SAVE_DIR}/latest.pth", epoch,
+                self._ema_save(f"{C.SAVE_DIR}/latest.pth", epoch,
                            val_loss, val_rel, val_save_rel)
 
             if is_best:
@@ -803,8 +970,14 @@ class Trainer:
                 # best_val_loss 必须来自同一轮，否则跨模型比较时是在比不同 epoch。
                 self.best_metrics = {"val_loss": val_loss, "val_rel": val_rel,
                                      "val_geom": val_save_rel, "epoch": epoch}
-                self._save(f"{C.SAVE_DIR}/best.pth", epoch,
+                self._ema_save(f"{C.SAVE_DIR}/best.pth", epoch,
                            val_loss, val_rel, val_save_rel)
+                # 只在被选中的这一轮上评估保留频点（不参与选模，无信息泄漏）
+                ho = self.evaluate_holdout()
+                if ho:
+                    self.best_metrics["holdout"] = ho
+                    print("  [保留频点] " + "  ".join(
+                        f"{k}: geom={v['geom']:.3f}" for k, v in ho.items()))
             else:
                 self.patience += 1
                 if self.patience >= C.EARLY_STOP_PATIENCE:
@@ -846,6 +1019,8 @@ class Trainer:
             "val_geom": float(bm["val_geom"]),
             "best_val_loss": float(bm["val_loss"]),
             "val_rel": float(bm["val_rel"]),
+            "holdout_freqs": list(C.get("HOLDOUT_FREQS") or []),
+            "holdout": bm.get("holdout"),
             "model_config": self.model_cfg.to_dict(),
             # 场景指纹：与别的 run 不一致就不能同表比较
             "scenario": self.scenario,
@@ -916,7 +1091,8 @@ def main(argv=None):
           f"模型={C.model_name_from_globals()}  "
           f"输出目录={C.SAVE_DIR}")
 
-    seed = int(C.get("SHUFFLE_SEED", 42))
+    _ts = C.get("TRAIN_SEED", None)
+    seed = int(_ts) if _ts is not None else int(C.get("SHUFFLE_SEED", 42))
     torch.manual_seed(seed)
     np.random.seed(seed)
 

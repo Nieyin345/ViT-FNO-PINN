@@ -293,6 +293,7 @@ class EMMultiFreqDataset(Dataset):
     def set_output_normalization(self, normalizer):
         """设置输出归一化器（data.norm_utils.OutputNormalizer）。"""
         self.output_normalizer = normalizer
+        self._item_cache = {}
 
     def _output_norm_slice(self, n_channels=None):
         if self.output_field == "all":
@@ -309,18 +310,31 @@ class EMMultiFreqDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        cache_key = (idx, bool(self.normalize), id(self.output_normalizer))
+        if hasattr(self, "_item_cache") and cache_key in self._item_cache:
+            return self._item_cache[cache_key]
         s = self.samples[idx]
         pol = int(s.get("polarization", 0))
 
         # 输入：SDF + Mask
-        patch = np.load(s["patch"], mmap_mode="r").astype(np.float32)
-        sdf = patch[:, :, 0] / (np.abs(patch[:, :, 0]).max() + 1e-8)
-        mask = patch[:, :, 1]
-        inp = torch.from_numpy(np.stack([sdf, mask], axis=0))
+        if not hasattr(self, "_patch_cache"):
+            self._patch_cache = {}
+            self._planes_cache = {}
+        inp = self._patch_cache.get(s["patch"])
+        if inp is None:
+            patch = np.load(s["patch"], mmap_mode="r").astype(np.float32)
+            sdf = patch[:, :, 0] / (np.abs(patch[:, :, 0]).max() + 1e-8)
+            mask = patch[:, :, 1]
+            inp = torch.from_numpy(np.stack([sdf, mask], axis=0))
+            self._patch_cache[s["patch"]] = inp
 
         # 输出：根据格式读取
         if s.get("fmt", "v1") == "v2_cache":
-            planes = np.load(s["field"], mmap_mode="r")
+            planes = self._planes_cache.get(s["field"])
+            if planes is None:
+                planes = np.load(s["field"])
+                if len(self._planes_cache) < 2000:
+                    self._planes_cache[s["field"]] = planes
             if planes.ndim == 6:
                 plane = planes[pol, s["freq_idx"], :, :, :]
             elif planes.ndim == 5 and planes.shape[0] == 2 and planes.shape[1] == 9:
@@ -427,4 +441,8 @@ class EMMultiFreqDataset(Dataset):
             res["out_zminus"] = torch.from_numpy(out_zminus)
             res["out_zplus"] = torch.from_numpy(out_zplus)
 
+        if not hasattr(self, "_item_cache"):
+            self._item_cache = {}
+        if len(self._item_cache) < 30000:
+            self._item_cache[cache_key] = res
         return res

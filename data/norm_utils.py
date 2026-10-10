@@ -109,6 +109,8 @@ class OutputNormalizer:
     def denormalize(self, y, ch_slice=None, tp=None):
         if not torch.is_tensor(y):
             return self.denormalize_np(y, ch_slice)
+        if ch_slice is None and getattr(y, "_phys_cache", None) is not None:
+            return y._phys_cache
         if tp is None:
             tp = self.tensor_params(y.device, ch_slice)
         if self.mode == "zscore":

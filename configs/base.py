@@ -47,6 +47,9 @@ BACKGROUND_PARAMS_PATH = os.path.join(_ROOT, "data", "blank", "background_params
 
 VAL_RATIO = 0.2
 SHUFFLE_SEED = 42
+# 训练随机种子（初始化/dropout/增强）。None = 沿用 SHUFFLE_SEED（旧行为）。
+# 需要「固定划分、重复多个随机种子」时设它（命令行 --train-seed），划分仍由 SHUFFLE_SEED 定。
+TRAIN_SEED = None
 
 
 # =============================================================================
@@ -60,8 +63,11 @@ MODES2 = 8
 WIDTH = 64
 N_LAYERS = 5
 FREQ_DIM = 32
-# 边界 padding：频域卷积依赖周期边界，pad 一圈可减轻 wrap-around。
-# 纯逐点模型（mlp）用不上，设为 0 可省约 48% 的算力。
+# 边界 padding（右/下各补 PADDING 圈 0，过完所有 FNO 块后再裁掉）。
+# 注意：HFSS 元胞是 Lattice-Pair 周期边界，场本身严格周期，FFT 卷积天然满足；
+# 补 0 反而在 [W, W+PADDING) 造出一条非物理的"零值边界"，破坏周期性、
+# 且只补右/下不对称。历史实验用 7；新实验用 PADDING=0 对照
+# （见 experiments.py 的 film_periodic*）。纯逐点模型（mlp）也可设 0。
 PADDING = 7
 
 # 模型条件向量：freq (B,2) = [归一化频率, 极化索引]。
@@ -116,6 +122,25 @@ EARLY_STOP_MIN_DELTA = 1e-5
 
 # 频率插值增强：训练时随机对 batch 做频率线性插值（宽带学习的数据增强）
 FREQ_INTERP_PROB = 0.3
+
+# 周期平移增强：训练时对 (input, output) 同步做随机 torch.roll。
+# 物理依据：周期元胞 + 正入射平面波 ⇒ 体系平移等变（散射场随贴片整体平移）。
+# 只作用于训练集；验证集不变。对带 out_zminus/out_zplus 的 batch 自动跳过。
+# 注意：SDFGeomEncoder(amp_phase=False) 用低频模的实/虚部，不具平移不变性，
+# 需配合 amp_phase=True 或让模型靠增强自己学。
+AUG_SHIFT = False
+# 相位参考系（core/phase_frame.py）：网络在去旋转系输出，DC/AC 各自乘以随频率线性旋转的相位后再进入损失
+PHASE_FRAME = False
+TRAIN_SHAPE_FRAC = 1.0   # <1：只用这一比例的训练形状（学习曲线实验；验证集不变）
+EMA_DECAY = 0.0   # >0 启用权重 EMA（如 0.995）；验证/保存用 EMA 权重
+PHASE_FRAME_SCALE = 1.0   # 仅对照实验用：把相位表整体乘以该系数（0.5=故意错的旋转）
+
+# 频率泛化的真正评估：这些频点**不进训练、也不进常规验证**，而是另开两组评估：
+#   unseenF_seenS   = 训练形状 × 保留频点   （只考频率泛化）
+#   unseenF_unseenS = 验证形状 × 保留频点   （频率 + 形状都未见）
+# 只在"被选为最优的那一轮"上计算并写进 summary.json，不参与选模，避免信息泄漏。
+# 用它时把 TRAIN_FREQS 设 None（全部频点），由本键决定保留哪些。空列表 = 旧行为。
+HOLDOUT_FREQS = []
 
 # H 组（弱场/非主导分量）损失权重偏置：
 # FNO 存在"傅里叶参数化偏差"(SpecB-FNO)，天然偏置主导频率(强 E 场)而淹没非主导的

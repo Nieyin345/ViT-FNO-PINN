@@ -38,9 +38,16 @@ class FourierFreqEncoder(nn.Module):
     （实测相对位移 0.0000），网络结构上无法区分这两个条件。
     """
 
-    def __init__(self, n_freqs: int = 16, out_dim: int = 32, extra_cols: int = 1):
+    def __init__(self, n_freqs: int = 16, out_dim: int = 32, extra_cols: int = 1,
+                 max_log2: float = 4.0):
+        """max_log2：最高傅里叶尺度 2^max_log2（默认 4 → 1~16，与历史一致）。
+
+        归一化频率 f∈[0,1]，已见频点间隔 0.125。尺度 16 的 sin/cos 在相邻频点间
+        转约 2 rad，足以让网络把每个训练频点当作离散标签"背下来"，内插能力差。
+        把 max_log2 降到 0~1 得到只含低带宽特征的平滑编码，见 configs 里的 h10_low*。
+        """
         super().__init__()
-        scales = 2 ** torch.linspace(0, 4, n_freqs)
+        scales = 2 ** torch.linspace(0, float(max_log2), n_freqs)
         self.register_buffer("scales", scales)
         self.extra_cols = int(extra_cols)
         self.mlp = nn.Sequential(

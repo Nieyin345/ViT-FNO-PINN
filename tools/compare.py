@@ -46,6 +46,10 @@ def parse_args(argv=None):
     p.add_argument("--epochs", type=int, required=True, help="每个组合的训练轮数")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None,
+                   help="固定 train/val split 的 SHUFFLE_SEED；所有对照应相同")
+    p.add_argument("--train-seed", type=int, default=None,
+                   help="训练随机种子；同一 seed 下配对比较不同实验")
     p.add_argument("--device", default=None, help="cuda/cpu，默认交给 tools.train 自动判断")
     p.add_argument("--runs-dir", default=DEFAULT_RUNS_DIR, help="结果根目录")
     p.add_argument("--resume", action="store_true",
@@ -63,12 +67,16 @@ def parse_int_list(s):
     return [int(v.strip()) for v in s.split(",") if v.strip()]
 
 
-def combo_name(exp, width, layers):
+def combo_name(exp, width, layers, seed=None, train_seed=None):
     parts = [exp]
     if width is not None:
         parts.append(f"w{width}")
     if layers is not None:
         parts.append(f"l{layers}")
+    if seed is not None:
+        parts.append(f"split{seed}")
+    if train_seed is not None:
+        parts.append(f"train{train_seed}")
     return "_".join(parts)
 
 
@@ -103,6 +111,10 @@ def run_one(exp, width, layers, name, args):
         cmd += ["--batch-size", str(args.batch_size)]
     if args.num_workers is not None:
         cmd += ["--num-workers", str(args.num_workers)]
+    if args.seed is not None:
+        cmd += ["--seed", str(args.seed)]
+    if args.train_seed is not None:
+        cmd += ["--train-seed", str(args.train_seed)]
     if args.device:
         cmd += ["--device", args.device]
     cmd += args.extra
@@ -154,6 +166,25 @@ def print_table(rows, failures):
                 str(r.get("best_epoch", "")), f"{r.get('minutes', 0):.1f}"]
         print("".join(str(v).ljust(w) for v, (_, w) in zip(vals, cols)))
     print("=" * len(header))
+    holdout_keys = sorted({
+        key for r in rows for key in (r.get("holdout") or {})
+    })
+    if holdout_keys:
+        print("\n保留频点评估（最佳 epoch；geom / rel，均越低越好）")
+        for r in ok:
+            parts = []
+            for key in holdout_keys:
+                h = (r.get("holdout") or {}).get(key)
+                if not h:
+                    continue
+                label = key.replace("unseenF_seenS", "seenS").replace(
+                    "unseenF_unseenS", "unseenS")
+                g, rel = h.get("geom"), h.get("rel")
+                g_text = f"{float(g):.4f}" if g is not None else "-"
+                r_text = f"{float(rel):.4f}" if rel is not None else "-"
+                parts.append(f"{label}: {g_text} / {r_text} (n={h.get('n', '?')})")
+            if parts:
+                print(f"  {r.get('name', '')}: " + "; ".join(parts))
     if failures:
         print(f"\n失败的组合 ({len(failures)}): {', '.join(failures)}")
 
@@ -199,19 +230,38 @@ def write_csv(rows, failures, path):
     fields = ["name", "model", "experiment", "width", "n_layers", "modes1", "modes2",
               "head", "kernel_cond", "lora_rank", "n_params",
               "val_geom", "val_rel", "best_val_loss", "best_epoch", "minutes",
-              "epochs", "scenario_fp", "split_fp", "loss_fp", "arch_fingerprint",
-              "save_dir", "status"]
+              "epochs", "shuffle_seed", "train_seed", "scenario_fp", "split_fp",
+              "loss_fp", "arch_fingerprint", "save_dir", "status"]
+    holdout_keys = sorted({
+        key for r in rows for key in (r.get("holdout") or {})
+    })
+    holdout_cols = {}
+    for key in holdout_keys:
+        safe = key.replace("@", "_").replace(".", "p").replace(" ", "_")
+        for metric in ("geom", "rel", "n"):
+            col = f"holdout_{safe}_{metric}"
+            fields.append(col)
+            holdout_cols[(key, metric)] = col
+
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         for r in rows:
             sc = r.get("scenario") or {}
+            sc_keys = sc.get("keys") or {}
             lr = r.get("loss_recipe") or {}
-            w.writerow({**r, "status": "ok",
-                        "scenario_fp": sc.get("fingerprint"),
-                        "split_fp": sc.get("split"),
-                        "loss_fp": lr.get("fingerprint")})
+            row = {**r, "status": "ok",
+                   "shuffle_seed": sc_keys.get("SHUFFLE_SEED"),
+                   "train_seed": sc_keys.get("TRAIN_SEED"),
+                   "scenario_fp": sc.get("fingerprint"),
+                   "split_fp": sc.get("split"),
+                   "loss_fp": lr.get("fingerprint")}
+            for key in holdout_keys:
+                metrics = (r.get("holdout") or {}).get(key) or {}
+                for metric in ("geom", "rel", "n"):
+                    row[holdout_cols[(key, metric)]] = metrics.get(metric)
+            w.writerow(row)
         for name in failures:
             w.writerow({"name": name, "status": "failed"})
     print(f"\n[汇总] {path}")
@@ -221,8 +271,12 @@ def main(argv=None):
     args = parse_args(argv)
     matrix = build_matrix(args)
 
-    names = [combo_name(e, w, l) for e, w, l in matrix]
-    print(f"实验矩阵: {len(matrix)} 个组合，每个 {args.epochs} epochs")
+    names = [combo_name(e, w, l, args.seed, args.train_seed)
+             for e, w, l in matrix]
+    split_seed = args.seed if args.seed is not None else "config default"
+    train_seed = args.train_seed if args.train_seed is not None else "config default"
+    print(f"实验矩阵: {len(matrix)} 个组合，每个 {args.epochs} epochs；"
+          f"SHUFFLE_SEED={split_seed}，TRAIN_SEED={train_seed}")
     for n in names:
         print(f"  - {n}")
     if args.dry_run:

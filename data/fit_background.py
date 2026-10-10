@@ -110,6 +110,9 @@ def fit_all_channels(volume_path="data/blank/blank/field_volume_merged.npy",
     return A_arr, phi_arr, offset_arr
 
 
+_BG_NPZ_CACHE = {}
+
+
 def get_background_field(freq_ghz: float, z_mm: float,
                          params_path="data/blank/background_params.npz",
                          polarization: int = 0) -> np.ndarray:
@@ -119,7 +122,11 @@ def get_background_field(freq_ghz: float, z_mm: float,
     Returns:
         field: (12,) 各通道的背景场值
     """
-    p = np.load(params_path)
+    p = _BG_NPZ_CACHE.get(params_path)
+    if p is None:
+        with np.load(params_path) as raw_p:
+            p = {k: raw_p[k] for k in raw_p.files}
+        _BG_NPZ_CACHE[params_path] = p
     freqs = p['freqs']
     fi = np.argmin(np.abs(freqs - freq_ghz))
 

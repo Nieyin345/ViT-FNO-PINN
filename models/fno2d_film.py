@@ -123,7 +123,11 @@ class FNO2dFiLM(FNOBase):
             for _ in range(cfg.n_layers)
         ])
 
-        self.freq_encoder = FourierFreqEncoder(n_freqs=16, out_dim=cfg.freq_dim)
+        # MODEL_EXTRA 可调：freq_enc_n（特征个数）、freq_enc_max_log2（最高尺度 2^x，默认 4）
+        _ex = cfg.extra or {}
+        self.freq_encoder = FourierFreqEncoder(
+            n_freqs=int(_ex.get("freq_enc_n", 16)), out_dim=cfg.freq_dim,
+            max_log2=float(_ex.get("freq_enc_max_log2", 4.0)))
         self.geom_encoder = SDFGeomEncoder(n_modes=4, out_dim=cfg.freq_dim)
         self.dropout = nn.Dropout2d(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         self.shared_proj = nn.Sequential(

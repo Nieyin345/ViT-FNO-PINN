@@ -373,7 +373,7 @@ def check_scenario_partition():
         "SPECTRAL_GAMMA_INIT", "SPECTRAL_GAMMA_FIXED", "ACTIVE_EXPERIMENT",
         "KERNEL_COND_MODE", "USE_SINE_INPUT", "USE_POL_COND", "LORA_RANK",
         "SAVE_LATEST_EVERY", "ONLY_SAVE_PTH", "VAL_EVERY", "NUM_WORKERS",
-        "PIN_MEMORY", "USE_SINGLE_OUTPUT_HEAD", "IN_CHANNELS",
+        "PIN_MEMORY", "USE_SINGLE_OUTPUT_HEAD", "IN_CHANNELS", "PHASE_FRAME", "PHASE_FRAME_SCALE", "EMA_DECAY",
     }
     allkeys = {k for k in vars(C) if k.isupper() and not k.startswith("_")}
     missing = allkeys - s - l - model_keys
