@@ -36,7 +36,7 @@ FREQ_LIST  = [8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 12.0]
 Z_MM       = np.arange(2, 24, 1, dtype=float)   # 22 层，2~23mm，步长 1mm
 CELL_MM    = 15.0                                # 单元尺寸 mm
 N_GRID     = 64                                  # 空间格点数
-DX         = CELL_MM / (N_GRID - 1) * 1e-3      # 空间步长 m
+DX         = CELL_MM / N_GRID * 1e-3            # 空间步长 m（周期元胞 N 个采样，dx=L/N）
 C0         = 3e8                                 # 光速 m/s
 BLANK_PATH = os.path.join(_HERE, "..", "data", "blank", "blank", "field_volume_merged.npy")
 Z_MM_BLANK = np.arange(2, 23.1, 0.5, dtype=float)  # blank 43层，步长0.5mm
@@ -104,7 +104,7 @@ def get_field_interp(volume, freq_idx, z_mm):
     return E, H
 
 
-def propagate(volume, freq_idx, src_z_mm, tgt_z_mm, lp_cutoff=0.8):
+def propagate(volume, freq_idx, src_z_mm, tgt_z_mm, lp_cutoff=float('inf')):
     """从源位置传播到目标位置，返回预测的总场 (E, H)。支持任意 z 值（插值）。"""
     freq_hz = FREQ_LIST[freq_idx] * 1e9
     dz = (tgt_z_mm - src_z_mm) * 1e-3  # m
@@ -398,4 +398,5 @@ class VisApp:
 
 
 if __name__ == "__main__":
+
     VisApp().run()

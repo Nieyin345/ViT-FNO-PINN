@@ -208,12 +208,29 @@ def main():
     ap.add_argument("--targets-mm", default=None,
                     help="目标 z 列表（mm，逗号分隔），默认 2~22 每隔 2mm")
     ap.add_argument("--cell-mm", type=float, default=CELL_MM, help="单元尺寸 mm")
+    ap.add_argument("--lp-cutoff", type=float, default=float("inf"),
+                    help="传播前低通截止（相对 k）。默认 inf=不滤波；旧默认 0.8 会滤掉 15mm 元胞的全部"
+                         "非零阶 Floquet 谐波，仅作对照用。")
+    ap.add_argument("--oracle-src", action="store_true",
+                    help="用仿真真值散射场（体数据在源截面的插值 − 背景）代替模型预测作为传播源，"
+                         "单独检验 PWS 传播本身的误差（与 FNO 无关）。需要 --sample-dir。")
     ap.add_argument("--scatter-out", action="store_true",
                     help="输出散射场而不是加回背景的总场")
     ap.add_argument("--out-dir", default="out_fno_prop", help="输出目录")
     args = ap.parse_args()
 
-    if args.from_plane:
+    if args.oracle_src:
+        if not args.sample_dir:
+            ap.error("--oracle-src 需要 --sample-dir")
+        _vol = _load_gt_volume(args.sample_dir)
+        if _vol is None:
+            ap.error(f"{args.sample_dir} 下没有 field_volume_merged.npy，无法做 oracle 源")
+        _fi = int(np.argmin(np.abs(np.array(FREQ_LIST) - args.freq_ghz)))
+        _zs = args.d_lam * _wavelength_mm(args.freq_ghz)
+        plane_src = (_gt_plane_at_z(_vol, _fi, _zs, args.pol)
+                     - _get_bg_plane(_fi, _zs, args.pol)).astype(np.float32)
+        print(f"[oracle] 源截面 = 仿真真值散射场 @ z={_zs:.3f} mm（不经过模型）")
+    elif args.from_plane:
         plane_src = np.load(args.from_plane).astype(np.float32)  # (H,W,12) 散射场
     elif args.sample_dir:
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -235,7 +252,9 @@ def main():
     fi = int(np.argmin(np.abs(np.array(FREQ_LIST) - args.freq_ghz)))
 
     H, W = plane_src.shape[:2]
-    dx = args.cell_mm / (W - 1) * 1e-3
+    # HFSS 导出的 W 个点是周期元胞的 W 个采样（不含重复的右边界），dx = L/W。
+    # 旧写法 L/(W-1) 会把空间频率轴整体拉偏 1/64 ≈ 1.6%，并破坏 FFT 周期性假设。
+    dx = args.cell_mm / W * 1e-3
     E_src, H_src = _plane_to_em(plane_src)
     lam_mm = _wavelength_mm(args.freq_ghz)
     z_src_mm = args.d_lam * lam_mm
@@ -249,13 +268,17 @@ def main():
     if args.sample_dir and os.path.isdir(args.sample_dir):
         gt = _load_gt_volume(args.sample_dir)
 
-    rel_ev, rel_hv = [], []
-    print(f"{'z(mm)':>8} {'rel L2 E':>10} {'rel L2 H':>10}  |E|max  |H|max")
-    print("-" * 52)
+    rel_ev, rel_hv, rel_sev, rel_shv = [], [], [], []
+    print("rel L2 E/H：与真值【总场】比；scat E/H：仅比【散射场】（真值总场 − 背景），"
+          "后者才反映 FNO+传播本身，前者被大背景平均压低。")
+    print(f"{'z(mm)':>8} {'rel L2 E':>10} {'rel L2 H':>10} {'scat E':>9} {'scat H':>9}  |E|max  |H|max")
+    print("-" * 72)
     for zt in targets:
         dz = (zt - z_src_mm) * 1e-3
         E_t, H_t = propagate_em_twoway_from_source(E_src, H_src, dx=dx, dy=dx,
-                                                   freq_hz=args.freq_ghz * 1e9, dz=dz)
+                                                   freq_hz=args.freq_ghz * 1e9, dz=dz,
+                                                   lp_cutoff=args.lp_cutoff)
+        E_sc, H_sc = E_t, H_t                      # 传播后的散射场（未加背景）
         if not args.scatter_out:
             bg = _get_bg_plane(fi, zt, args.pol)
             bgE, bgH = _plane_to_em(bg)
@@ -272,18 +295,21 @@ def main():
             rh = _rel_l2_complex(H_t, gtH)
             rel_ev.append(re); rel_hv.append(rh)
             line += f"{re:10.3f} {rh:10.3f} "
+            gsE, gsH = _plane_to_em(gt_plane - _get_bg_plane(fi, zt, args.pol))
+            rse, rsh = _rel_l2_complex(E_sc, gsE), _rel_l2_complex(H_sc, gsH)
+            rel_sev.append(rse); rel_shv.append(rsh)
+            line += f"{rse:9.3f} {rsh:9.3f} "
         else:
-            line += f"{'--':>10} {'--':>10} "
+            line += f"{'--':>10} {'--':>10} {'--':>9} {'--':>9} "
         line += f"{np.abs(E_t).max():8.1f} {np.abs(H_t).max():8.4f}"
         print(line)
 
     if rel_ev:
         print(f"\n传播平均 rel L2: E={np.mean(rel_ev):.3f}, H={np.mean(rel_hv):.3f} "
               f"(目标 {len(targets)} 个 z 平面)")
+        print(f"散射场平均 rel L2: E={np.mean(rel_sev):.3f}, H={np.mean(rel_shv):.3f}")
     print(f"已保存平面到: {out_dir}")
 
 
 if __name__ == "__main__":
     main()
-
-

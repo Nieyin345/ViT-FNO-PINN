@@ -311,7 +311,7 @@ def dc_ac_directional_mean_loss(pred, true, w_dc=1.0, w_ac=1.0, eps=1e-6):
         "ac_rel": ac_rel.detach(),
     }
 
-def maxwell_pinn_loss(pred, true_zminus, true_zplus, freq_ghz, delta_z_mm=1.0, dx_mm=30.0/64.0, dy_mm=30.0/64.0):
+def maxwell_pinn_loss(pred, true_zminus, true_zplus, freq_ghz, delta_z_mm=1.0, dx_mm=15.0/64.0, dy_mm=15.0/64.0):  # 元胞 15 mm / 64 点（旧默认 30/64 差 2 倍）
     """
     推断时物理优化 (TTO) 使用的严格麦克斯韦残差损失 (基于中心差分)。
     
