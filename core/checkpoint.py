@@ -141,6 +141,39 @@ def load(path: str, map_location: str = "cpu", *, eval_mode: bool = True,
         ) from e
 
     normalizer = OutputNormalizer.from_checkpoint(ckpt)
+
+    # ── 相位参考系：必须在**这里**接上,不能留给每个调用方 ──────────────────
+    #
+    # PHASE_FRAME 模型的网络输出在"去旋转系"里,要乘回随频率旋转的相位才是物理场。
+    # 这件事以前只写在 `tools/train.py::Trainer._fwd` 里,于是训练之外的每一条链路
+    # (diag_error / eval / probe / ui_eval / visualize / propagate_fno_prediction)
+    # 都在拿**去旋转的预测**去比**没去旋转的真值**。
+    #
+    # 它骗过了所有人,是因为相位表以 10 GHz 为锚:10 GHz 处旋转恰好是单位阵,
+    # 而留出频点正好就是 10 GHz —— 那个数是对的,其它频点全错。实测(A6ema seed1,
+    # rectangle,`tools/diag_pf.py`):正确口径 geom 0.181,漏掉旋转后报 1.191,
+    # 差 6.6 倍;8.5 GHz 处是 0.097 vs 1.608,差 16 倍。
+    #
+    # 所以包在加载处:凡是从 checkpoint 拿模型的人,拿到的就是**物理场**。
+    pf_flag = ckpt.get("phase_frame")
+    if pf_flag is None:
+        pf_flag = False
+        if not quiet:
+            print("[Checkpoint] ⚠ 这份权重没记 phase_frame 标记(训练于该字段加入之前)。"
+                  "按**不启用**处理;若它其实是 PHASE_FRAME 训练出来的,结果会整体错相位。")
+    if pf_flag:
+        if normalizer is None:
+            raise ValueError(f"{path} 记录了 phase_frame=True 但没有 normalizer —— "
+                             "相位系需要反归一化才能旋转,这份权重不可用。")
+        from .phase_frame import PhaseFrame, PhaseFramedModel
+        pf = PhaseFrame(normalizer, ckpt.get("phase_frame_fmin", 8.0),
+                        ckpt.get("phase_frame_fmax", 12.0),
+                        torch.device(map_location if isinstance(map_location, str) else "cpu"),
+                        scale=float(ckpt.get("phase_frame_scale", 1.0)))
+        model = PhaseFramedModel(model, pf)
+        if not quiet:
+            print("[Checkpoint] 已套上 PhaseFrame(输出为物理场,与训练口径一致)")
+
     if eval_mode:
         model.eval()
 
